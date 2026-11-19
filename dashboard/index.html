@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Token Radar — pre-token protocols ranked by implied value</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <div class="mark">◈</div>
+    <div>
+      <h1>Token Radar</h1>
+      <p class="sub">Pre-token protocols, ranked by the value a token would carry</p>
+    </div>
+  </div>
+  <div class="meta" id="meta"></div>
+</header>
+
+<section class="stats" id="stats" aria-label="Board summary"></section>
+
+<section class="toolbar" aria-label="Filters">
+  <input id="q" type="search" placeholder="Search a protocol…" aria-label="Search protocols">
+  <select id="cat" aria-label="Filter by category"><option value="">All categories</option></select>
+  <select id="chain" aria-label="Filter by chain"><option value="">All chains</option></select>
+  <div class="toggle" role="tablist" aria-label="Board view">
+    <button id="tab-board" role="tab" aria-selected="true">Pre-token board</button>
+    <button id="tab-live" role="tab" aria-selected="false">Live tokens</button>
+  </div>
+</section>
+
+<main>
+  <div class="wrap">
+    <table id="board" aria-label="Ranked board">
+      <thead><tr>
+        <th data-k="rank">#</th>
+        <th data-k="name">Protocol</th>
+        <th data-k="category">Category</th>
+        <th data-k="chains">Chains</th>
+        <th data-k="tvl_usd">TVL</th>
+        <th data-k="change_7d">7d</th>
+        <th data-k="age_days">Age</th>
+        <th data-k="implied_value_usd">Implied</th>
+      </tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <p class="hint" id="count"></p>
+  </div>
+  <aside id="detail" aria-label="Protocol detail"></aside>
+</main>
+
+<section class="model" id="model" aria-label="The model">
+  <h2>How the radar scores</h2>
+  <p class="formula">implied = TVL × multiple × growth × maturity × breadth</p>
+  <div class="consts" id="consts"></div>
+  <div class="sandbox" id="sandbox">
+    <h3>Try the model</h3>
+    <p class="note">Move a constant and the board re-ranks live. The submitted board uses the constants above.</p>
+    <div class="sliders" id="sliders"></div>
+    <p class="note" id="sandbox-out"></p>
+  </div>
+</section>
+
+<footer>
+  <p>Data: DefiLlama snapshot <span id="asof"></span>. “Records no token” means the snapshot carries no market cap, CoinGecko id or symbol for the protocol — it is not proof the protocol has no token. Implied values are this radar's own claim, never make.fun's. No token launch is predicted.</p>
+</footer>
+<script src="../data.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
