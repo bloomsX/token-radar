@@ -26,6 +26,20 @@
   // ---- farm steps: the same rules lib/model.ts uses, so the detail view
   // shows exactly the steps board.json carries for the row. ----
   function chainOf(r) { return r.chains.length ? r.chains[0] : 'its main chain'; }
+  var CHAIN_GAS = {
+    ethereum: 'ETH', arbitrum: 'ETH', base: 'ETH', optimism: 'ETH', linea: 'ETH',
+    scroll: 'ETH', 'zksync era': 'ETH', unichain: 'ETH', mode: 'ETH', blast: 'ETH',
+    ink: 'ETH', katana: 'ETH', 'world chain': 'ETH',
+    solana: 'SOL', avalanche: 'AVAX', polygon: 'POL', tron: 'TRX', sui: 'SUI',
+    monad: 'MON', binance: 'BNB', 'bnb chain': 'BNB', bsc: 'BNB', fantom: 'FTM',
+    sonic: 'S', celo: 'CELO', cardano: 'ADA', ton: 'TON', sei: 'SEI', berachain: 'BERA',
+    xdai: 'xDAI', gnosis: 'xDAI', 'hyperliquid l1': 'HYPE', mantle: 'MNT', bitcoin: 'BTC',
+    near: 'NEAR', aptos: 'APT', injective: 'INJ', cronos: 'CRO', stellar: 'XLM',
+    ripple: 'XRP', flare: 'FLR', polkadot: 'DOT', kusama: 'KSM', 'cosmos hub': 'ATOM',
+    osmosis: 'OSMO', kava: 'KAVA', algorand: 'ALGO', hedera: 'HBAR', tezos: 'XTZ',
+    vechain: 'VET', multiversx: 'EGLD', zilliqa: 'ZIL'
+  };
+  function gasFor(chain) { return CHAIN_GAS[(chain || '').toLowerCase()] || null; }
   function capitalFor(r) {
     if (r.tvl_usd >= 5e9) return 250;
     if (r.tvl_usd >= 1e9) return 150;
@@ -60,14 +74,41 @@
     if (s.length < 20) s += ' Keep the position open and check the protocol\'s own page.';
     return s;
   }
+  function weeklyFor(r, chain) {
+    var c = (r.category || '').toLowerCase();
+    if (c.indexOf('lend') >= 0 || c.indexOf('cdp') >= 0 || c.indexOf('collateral') >= 0) return 'Borrow $20 against the deposit and repay it the same week, so the wallet shows a full borrow cycle.';
+    if (c.indexOf('dex') >= 0 || c.indexOf('yield') >= 0 || c.indexOf('leveraged farm') >= 0) return 'Swap $10 through the pool each week, alternating the direction, so the wallet shows repeated trading.';
+    if (c.indexOf('bridge') >= 0) return 'Bridge $5 back the other way each week, so the wallet shows two-way volume.';
+    if (c.indexOf('staking') >= 0 || c.indexOf('restak') >= 0) return 'Claim any staking rewards each week and restake them, so the wallet shows compounding use.';
+    if (c.indexOf('perpetual') >= 0 || c.indexOf('derivative') >= 0) return 'Open one small hedged position each week and close it the same day.';
+    if (c.indexOf('prediction') >= 0) return 'Settle one small position in a live market each week.';
+    if (c.indexOf('curator') >= 0 || c.indexOf('allocator') >= 0) return 'Claim any vault rewards each week and re-deposit them, so the wallet shows compounding use.';
+    if (c.indexOf('stable') >= 0) return 'Mint or redeem $10 of the stable asset each week.';
+    if (c.indexOf('rwa') >= 0) return 'Check the asset\'s accrued yield each week and mint $10 more of it.';
+    if (c.indexOf('insurance') >= 0) return 'Check the policy each week and renew it before it lapses.';
+    if (c.indexOf('payment') >= 0) return 'Route one real payment through the app each week.';
+    if (c.indexOf('chain') >= 0) return 'Do one real transaction on ' + chain + ' each week.';
+    return 'Make one real deposit, swap or vote each week.';
+  }
+  function holdText(r, age, hold) {
+    if (age === null || age === undefined) return 'Keep the position open for at least ' + hold + ' days, so the activity spans more than one monthly snapshot.';
+    if (age >= 365) return 'Keep the position open for at least ' + hold + ' days — ' + r.name + ' has already run ' + age + ' days with no token, and airdrops after a long wait usually reward the wallets that stayed.';
+    if (age < 180) return 'Keep the position open for at least ' + hold + ' days — ' + r.name + ' is only ' + age + ' days old, so a ' + hold + '-day hold puts you in from the early side.';
+    return 'Keep the position open for at least ' + hold + ' days, so the activity spans more than one monthly snapshot.';
+  }
+  function rewardsText(r, chain) {
+    var gas = gasFor(chain);
+    if (gas !== null) return 'Check ' + r.name + '\'s own site for a rewards or points page it publishes, and claim only through a link on that page. On ' + chain + ', gas is paid in ' + gas + ', so keep a little ' + gas + ' in the wallet.';
+    return 'Check ' + r.name + '\'s own site for a rewards or points page it publishes, and claim only through a link on that page.';
+  }
   function farmSteps(r) {
     var chain = chainOf(r), capital = capitalFor(r), hold = holdDaysFor(r.age_days);
     return [
       stepText('Open a fresh wallet that holds only the funds you plan to farm, and store its recovery phrase offline, never in a screenshot or a chat.', 'under $3 of gas for the first transaction', '5 minutes'),
       stepText(actionFor(r, capital, chain), '$' + capital + ' of capital and about $' + (capital >= 150 ? 8 : 4) + ' of gas', '15 minutes to set up'),
-      stepText('Return once a week and do one real action on ' + chain + ' — a deposit, a swap, a borrow or a vote — so the wallet shows repeated use.', 'about $2 of gas a week', '10 minutes a week'),
-      stepText('Keep the position open for at least ' + hold + ' days, so the activity spans more than one monthly snapshot.', 'the $' + capital + ' stays in the position', hold + ' days'),
-      stepText('Check ' + r.name + '\'s own site for a rewards or points page it publishes, and claim only through a link on that page.', 'no fee to check, and never pay to claim', '10 minutes'),
+      stepText(weeklyFor(r, chain), 'about $2 of gas a week', '10 minutes a week'),
+      stepText(holdText(r, r.age_days, hold), 'the $' + capital + ' stays in the position', hold + ' days'),
+      stepText(rewardsText(r, chain), 'no fee to check, and never pay to claim', '10 minutes'),
       stepText('Record the wallet address, the dates and every transaction hash in a farm log, so you can repeat the position or unwind it cleanly.', 'nothing but the log', '5 minutes')
     ];
   }
@@ -125,19 +166,28 @@
   function render() {
     var list = sortRows(visibleRows());
     var live = state.view === 'live';
+    // The detail panel is never empty: with no selection, show the first
+    // visible row, so the board shot carries a populated detail view.
+    if (!state.sel && list.length) state.sel = list[0].slug;
+    var maxVal = 1;
+    (live ? R.live : R.rows).forEach(function (r) {
+      var v = live ? (r.mcap_usd || 0) : r.implied_value_usd;
+      if (v > maxVal) maxVal = v;
+    });
     rowsEl.innerHTML = list.map(function (r) {
       var val = live ? (r.mcap_usd || 0) : r.implied_value_usd;
       var chg = r.change_7d;
       var cls = chg === null ? '' : (chg >= 0 ? 'up' : 'down');
+      var barw = Math.max(4, Math.round(Math.sqrt(val / maxVal) * 100));
       return '<tr data-slug="' + esc(r.slug) + '" class="' + (state.sel === r.slug ? 'sel' : '') + '">' +
         '<td class="num">' + (live ? '—' : r.rank) + '</td>' +
-        '<td><span class="nm">' + esc(r.name) + '</span><br><span class="sl">' + esc(r.slug) + '</span></td>' +
+        '<td><span class="nm">' + esc(r.name) + '</span><br><span class="sl">' + esc(r.slug) + '</span> <span class="nt' + (live ? ' live' : '') + '">● ' + (live ? 'live' : 'no token') + '</span></td>' +
         '<td>' + esc(r.category || '—') + '</td>' +
         '<td>' + r.chains.slice(0, 2).map(function (c) { return '<span class="tag">' + esc(c) + '</span>'; }).join('') + (r.chains.length > 2 ? '<span class="tag">+' + (r.chains.length - 2) + '</span>' : '') + '</td>' +
         '<td class="num">' + money(r.tvl_usd) + '</td>' +
         '<td class="num ' + cls + '">' + pct(chg) + '</td>' +
         '<td class="num">' + (live ? '—' : ageStr(r.age_days)) + '</td>' +
-        '<td class="num"><b>' + money(val) + '</b></td></tr>';
+        '<td class="num"><b>' + money(val) + '</b><div class="vbar" title="Square-root scale: the tail stays readable"><div style="width:' + barw + '%"></div></div></td></tr>';
     }).join('');
     countEl.textContent = list.length + ' of ' + (live ? R.live_size : R.board_size) + ' protocols' + (sandbox && !live ? ' — re-ranked by the sandbox constants below' : '');
     renderDetail();
@@ -158,17 +208,24 @@
     if (!r) for (var j = 0; j < R.live.length; j++) if (R.live[j].slug === state.sel) { r = R.live[j]; break; }
     if (!r) { detailEl.innerHTML = '<p class="empty">Protocol not found.</p>'; return; }
     var live = state.view === 'live' || r.mcap_usd !== null;
-    var h = '<h2>' + esc(r.name) + '</h2><p class="note">' + esc(r.slug) + ' · ' + esc(r.category || 'uncategorised') + ' · ' + r.chains.map(esc).join(', ') + '</p>';
+    var chainList = r.chains.length > 4 ? r.chains.slice(0, 4).map(esc).join(', ') + ' +' + (r.chains.length - 4) + ' more' : r.chains.map(esc).join(', ');
+    var h = '<h2>' + esc(r.name) + '</h2><p class="note">' + esc(r.slug) + ' · ' + esc(r.category || 'uncategorised') + ' · ' + chainList + '</p>';
     h += '<div class="rowline"><span>TVL</span><b>' + money(r.tvl_usd) + '</b></div>';
     h += '<div class="rowline"><span>7-day change</span><b class="' + (r.change_7d === null ? '' : (r.change_7d >= 0 ? 'up' : 'down')) + '">' + pct(r.change_7d) + '</b></div>';
     if (live) {
       h += '<div class="rowline"><span>Market cap</span><b>' + money(r.mcap_usd || 0) + '</b></div>';
       h += '<p class="note">This protocol records a token, so the board shows the market\u2019s own value — it is never ranked on the pre-token board.</p>';
     } else {
+      var v = impliedOf(r, R.model);
       h += '<div class="rowline"><span>Implied value</span><b class="big">' + money(r.implied_value_usd) + '</b></div>';
       h += '<div class="rowline"><span>Age with no token</span><b>' + ageStr(r.age_days) + '</b></div>';
       h += '<div class="bars">' + bar('Base multiple', r.base_multiple, 1.5) + bar('Growth', r.growth_multiplier, 2) + bar('Maturity', r.maturity_multiplier, 1) + bar('Breadth', r.breadth_multiplier, 1.2) + '</div>';
-      h += '<h3>Farm plan</h3><ol>' + farmSteps(r).map(function (s) { return '<li>' + esc(s) + '</li>'; }).join('') + '</ol>';
+      h += '<p class="note">Model ' + esc(R.model_version) + ': the page recomputes this row from the snapshot\u2019s own figures as ' + money(v.implied) + ', the same number board.json carries. This is an estimate, not a price.</p>';
+      h += '<h3>Farm plan</h3><ol>' + farmSteps(r).map(function (s) {
+        var cut = s.indexOf(' Cost: ');
+        if (cut < 0) return '<li>' + esc(s) + '</li>';
+        return '<li>' + esc(s.slice(0, cut)) + ' <span class="ct">' + esc(s.slice(cut + 1)) + '</span></li>';
+      }).join('') + '</ol>';
     }
     detailEl.innerHTML = h;
   }

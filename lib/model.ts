@@ -309,6 +309,72 @@ function chainOf(p: SnapshotProtocol): string {
   return p.chains.length > 0 ? p.chains[0]! : 'its main chain';
 }
 
+/**
+ * The gas token a chain settles fees in, by the chain's name as the snapshot
+ * spells it (matched case-insensitively). Only chains whose gas token is
+ * settled public knowledge are listed; anything else gets the neutral
+ * wording, never a guess.
+ */
+const CHAIN_GAS: Record<string, string> = {
+  ethereum: 'ETH',
+  arbitrum: 'ETH',
+  base: 'ETH',
+  optimism: 'ETH',
+  linea: 'ETH',
+  scroll: 'ETH',
+  'zksync era': 'ETH',
+  unichain: 'ETH',
+  mode: 'ETH',
+  blast: 'ETH',
+  ink: 'ETH',
+  katana: 'ETH',
+  'world chain': 'ETH',
+  solana: 'SOL',
+  avalanche: 'AVAX',
+  polygon: 'POL',
+  tron: 'TRX',
+  sui: 'SUI',
+  monad: 'MON',
+  binance: 'BNB',
+  'bnb chain': 'BNB',
+  bsc: 'BNB',
+  fantom: 'FTM',
+  sonic: 'S',
+  celo: 'CELO',
+  cardano: 'ADA',
+  ton: 'TON',
+  sei: 'SEI',
+  berachain: 'BERA',
+  xdai: 'xDAI',
+  gnosis: 'xDAI',
+  'hyperliquid l1': 'HYPE',
+  mantle: 'MNT',
+  bitcoin: 'BTC',
+  near: 'NEAR',
+  aptos: 'APT',
+  injective: 'INJ',
+  cronos: 'CRO',
+  stellar: 'XLM',
+  ripple: 'XRP',
+  flare: 'FLR',
+  polkadot: 'DOT',
+  kusama: 'KSM',
+  'cosmos hub': 'ATOM',
+  osmosis: 'OSMO',
+  kava: 'KAVA',
+  algorand: 'ALGO',
+  hedera: 'HBAR',
+  tezos: 'XTZ',
+  vechain: 'VET',
+  multiversx: 'EGLD',
+  zilliqa: 'ZIL',
+};
+
+/** The gas token of a chain, or null when it is not settled knowledge. */
+function gasFor(chain: string): string | null {
+  return CHAIN_GAS[chain.toLowerCase()] ?? null;
+}
+
 /** How much capital one farm position needs, from the protocol's own TVL. */
 function capitalFor(p: SnapshotProtocol): number {
   if (p.tvl_usd >= 5_000_000_000) return 250;
@@ -344,12 +410,47 @@ function actionFor(p: SnapshotProtocol, capital: number, chain: string): string 
   return `Deposit $${capital} of USDC into ${name} on ${chain} and keep the position open.`;
 }
 
+/** The category's weekly action: one real, repeatable move that fits what the protocol does. */
+function weeklyFor(p: SnapshotProtocol, chain: string): string {
+  const c = (p.category ?? '').toLowerCase();
+  if (c.includes('lend') || c.includes('cdp') || c.includes('collateral')) return `Borrow $20 against the deposit and repay it the same week, so the wallet shows a full borrow cycle.`;
+  if (c.includes('dex') || c.includes('yield') || c.includes('leveraged farm')) return `Swap $10 through the pool each week, alternating the direction, so the wallet shows repeated trading.`;
+  if (c.includes('bridge')) return `Bridge $5 back the other way each week, so the wallet shows two-way volume.`;
+  if (c.includes('staking') || c.includes('restak')) return `Claim any staking rewards each week and restake them, so the wallet shows compounding use.`;
+  if (c.includes('perpetual') || c.includes('derivative')) return `Open one small hedged position each week and close it the same day.`;
+  if (c.includes('prediction')) return `Settle one small position in a live market each week.`;
+  if (c.includes('curator') || c.includes('allocator')) return `Claim any vault rewards each week and re-deposit them, so the wallet shows compounding use.`;
+  if (c.includes('stable')) return `Mint or redeem $10 of the stable asset each week.`;
+  if (c.includes('rwa')) return `Check the asset's accrued yield each week and mint $10 more of it.`;
+  if (c.includes('insurance')) return `Check the policy each week and renew it before it lapses.`;
+  if (c.includes('payment')) return `Route one real payment through the app each week.`;
+  if (c.includes('chain')) return `Do one real transaction on ${chain} each week.`;
+  return `Make one real deposit, swap or vote each week.`;
+}
+
+/** The hold step's wording: the protocol's own age makes the wait concrete. */
+function holdText(p: SnapshotProtocol, age: number | null, hold: number): string {
+  if (age === null) return `Keep the position open for at least ${hold} days, so the activity spans more than one monthly snapshot.`;
+  if (age >= 365) return `Keep the position open for at least ${hold} days — ${p.name} has already run ${age} days with no token, and airdrops after a long wait usually reward the wallets that stayed.`;
+  if (age < 180) return `Keep the position open for at least ${hold} days — ${p.name} is only ${age} days old, so a ${hold}-day hold puts you in from the early side.`;
+  return `Keep the position open for at least ${hold} days, so the activity spans more than one monthly snapshot.`;
+}
+
+/** The rewards-check step: the chain's gas token, where it is settled knowledge. */
+function rewardsText(p: SnapshotProtocol, chain: string): string {
+  const gas = gasFor(chain);
+  if (gas !== null) return `Check ${p.name}'s own site for a rewards or points page it publishes, and claim only through a link on that page. On ${chain}, gas is paid in ${gas}, so keep a little ${gas} in the wallet.`;
+  return `Check ${p.name}'s own site for a rewards or points page it publishes, and claim only through a link on that page.`;
+}
+
 /**
  * A protocol's farm plan: six steps, each an action with a cost and a time.
  * The plan is derived from the protocol's own record (category, chains, TVL,
  * age), never from a hand-written list of names, and it never claims the
  * protocol runs a points program or will issue a token: it says only to check
- * the protocol's own site for a rewards page it publishes.
+ * the protocol's own site for a rewards page it publishes. The weekly action,
+ * the hold and the rewards check are written for this protocol, not copied
+ * across the board: the same six steps do not repeat for all 226 rows.
  */
 export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   const chain = chainOf(p);
@@ -368,17 +469,17 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
       time: '15 minutes to set up',
     },
     {
-      text: `Return once a week and do one real action on ${chain} — a deposit, a swap, a borrow or a vote — so the wallet shows repeated use.`,
+      text: weeklyFor(p, chain),
       cost: 'about $2 of gas a week',
       time: '10 minutes a week',
     },
     {
-      text: `Keep the position open for at least ${hold} days, so the activity spans more than one monthly snapshot.`,
+      text: holdText(p, age, hold),
       cost: `the $${capital} stays in the position`,
       time: `${hold} days`,
     },
     {
-      text: `Check ${p.name}'s own site for a rewards or points page it publishes, and claim only through a link on that page.`,
+      text: rewardsText(p, chain),
       cost: 'no fee to check, and never pay to claim',
       time: '10 minutes',
     },
