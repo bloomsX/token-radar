@@ -1,4 +1,7 @@
-// Token radar, model radar-2 (Node 22, standard library only).
+// Token radar, model radar-3 (Node 22, standard library only).
+// radar-3 sharpens radar-2's weights: momentum counts double, patience
+// counts more, and the TVL multiple declines steeply with size, so the
+// board's order below the top five moves against a plain TVL table.
 //
 // Reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>),
 // scores every rankable pre-token protocol with the model in lib/model.ts,
