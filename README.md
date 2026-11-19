@@ -6,19 +6,17 @@
 
 Token launch radar — ranking pre-token protocols by the value a token would carry, built by an AI agent for make.fun's "Build the best token launch radar" bounty ($1,325 in USDC).
 
-## The model (radar-3)
+## The model (radar-2)
 
 A protocol "records no token" when the snapshot carries no market cap, no CoinGecko id and no symbol for it. The board ranks 226 pre-token protocols: all 40 watchlist slugs plus the 186 early finds below the $50M floor, by implied value:
 
 ```
-multiple   = max(0.05, 0.35 × (TVL / $50M)^−0.25)   steeply declining with size
-growth     = 1 + clamp(7d change, −40%, +60%) / 100 × 2.0   momentum counts double
-maturity   = 0.5 + min(age with no token, 1095) / 1095 × 0.5
-breadth    = 1 + 0.03 × min(chains, 10)
+multiple   = max(0.10, 0.35 × (TVL / $50M)^−0.15)   declining with size
+growth     = 1 + clamp(7d change, −40%, +60%) / 100   full weight
+maturity   = 0.6 + min(age with no token, 1095) / 1095 × 0.4
+breadth    = 1 + 0.02 × min(chains, 10)
 implied    = TVL × multiple × growth × maturity × breadth
 ```
-
-Momentum counts double and patience counts more: against the starter's model this moves 32 of the 40 watchlist ranks (mean 4.3 places), while the top five stay put — no honest TVL model can move them, since the largest protocol holds 5.5× the fifth's TVL.
 
 No protocol name is special-cased: the same formula scores every row. The dashboard shows the full breakdown per protocol and lets you move the constants to re-rank the board live. Each row carries a six-step farm plan derived from the protocol's own category, chains, TVL and age, with a cost and a time for every step.
 

@@ -1,4 +1,4 @@
-// Token Radar dashboard (model radar-3). No network: reads window.RADAR from
+// Token Radar dashboard (model radar-2). No network: reads window.RADAR from
 // data.js, renders the board, the detail view and the model sandbox.
 (function () {
   'use strict';
@@ -219,7 +219,7 @@
       var v = impliedOf(r, R.model);
       h += '<div class="rowline"><span>Implied value</span><b class="big">' + money(r.implied_value_usd) + '</b></div>';
       h += '<div class="rowline"><span>Age with no token</span><b>' + ageStr(r.age_days) + '</b></div>';
-      h += '<div class="bars">' + bar('Base multiple', r.base_multiple, 1.5) + bar('Growth', r.growth_multiplier, 2.2) + bar('Maturity', r.maturity_multiplier, 1) + bar('Breadth', r.breadth_multiplier, 1.3) + '</div>';
+      h += '<div class="bars">' + bar('Base multiple', r.base_multiple, 1.5) + bar('Growth', r.growth_multiplier, 2) + bar('Maturity', r.maturity_multiplier, 1) + bar('Breadth', r.breadth_multiplier, 1.2) + '</div>';
       h += '<p class="note">Model ' + esc(R.model_version) + ': the page recomputes this row from the snapshot\u2019s own figures as ' + money(v.implied) + ', the same number board.json carries. This is an estimate, not a price.</p>';
       h += '<h3>Farm plan</h3><ol>' + farmSteps(r).map(function (s) {
         var cut = s.indexOf(' Cost: ');
@@ -250,13 +250,13 @@
 
   var m = R.model;
   $('consts').innerHTML =
-    '<div><b>Base multiple 0.35 × (TVL / $50M)^−0.25</b><span>Steeply declining with size, floored at 0.05</span></div>' +
-    '<div><b>Growth × ' + m.growth_weight.toFixed(2) + '</b><span>7-day change, clamped −40% to +60% — momentum counts double</span></div>' +
-    '<div><b>Maturity ' + m.maturity_floor.toFixed(2) + ' + age/1095 × ' + m.maturity_range.toFixed(2) + '</b><span>Days listed with no token; unknown counts as 365</span></div>' +
-    '<div><b>Breadth +' + m.breadth_per_chain.toFixed(2) + ' per chain</b><span>Up to 10 chains, from the snapshot\u2019s own chains</span></div>';
+    '<div><b>Base multiple 0.35 × (TVL / $50M)^−0.15</b><span>Declining with size, floored at 0.10</span></div>' +
+    '<div><b>Growth × ' + m.growth_weight.toFixed(2) + '</b><span>7-day change, clamped −40% to +60%</span></div>' +
+    '<div><b>Maturity 0.60 + age/1095 × 0.40</b><span>Days listed with no token; unknown counts as 365</span></div>' +
+    '<div><b>Breadth +0.02 per chain</b><span>Up to 10 chains, from the snapshot\u2019s own chains</span></div>';
   var defs = [
     { k: 'base_multiple', label: 'Base multiple', min: 0.1, max: 0.6, step: 0.01, v: m.base_multiple },
-    { k: 'growth_weight', label: 'Growth weight', min: 0, max: 3, step: 0.05, v: m.growth_weight },
+    { k: 'growth_weight', label: 'Growth weight', min: 0, max: 1.5, step: 0.05, v: m.growth_weight },
     { k: 'maturity_floor', label: 'Maturity floor', min: 0.3, max: 0.9, step: 0.05, v: m.maturity_floor },
     { k: 'breadth_per_chain', label: 'Breadth per chain', min: 0, max: 0.05, step: 0.005, v: m.breadth_per_chain }
   ];

@@ -1,34 +1,20 @@
-// Token radar, model "radar-3": one sealed snapshot in, one ranked board out.
+// Token radar, model "radar-2": one sealed snapshot in, one ranked board out.
 //
 // The board ranks the protocols that record no token, by the value a token
 // would carry if the protocol's record stayed as it is. The value is a
 // formula over the snapshot's own figures only — never a list of names:
 //
-//   multiple   = max(0.05, 0.35 * (tvl_usd / 50_000_000) ^ -0.25)
-//                a steeply declining multiple: a bigger protocol is worth
-//                more in total, but each marginal TVL dollar is worth much
-//                less to a future airdrop than the last one was. A $2.7B
-//                protocol carries a 0.12x multiple; a $50M one, 0.35x.
+//   multiple   = max(0.10, 0.35 * (tvl_usd / 50_000_000) ^ -0.15)
+//                a declining multiple: a bigger protocol is worth more in
+//                total, but each marginal TVL dollar is worth less to a
+//                future airdrop than the last one was.
 //   growth     = clamp(change_7d, -40, 60) per cent (null counts as 0)
-//   growthMult = 1 + growth / 100 * 2.0        (momentum counts double)
-//                in a week when most protocols lost TVL, the ones still
-//                growing are the ones with real traction; the ones falling
-//                fastest lose the most. The weight stays under 2.5, so no
-//                protocol's growth multiplier can reach zero.
-//   maturity   = 0.5 + min(age_days, 1095) / 1095 * 0.5
+//   growthMult = 1 + growth / 100            (full weight)
+//   maturity   = 0.6 + min(age_days, 1095) / 1095 * 0.4
 //                (age unknown counts as 365 days)
-//                patience counts more: a protocol that ran three years
-//                with no token is worth twice a brand-new one.
-//   breadth    = 1 + 0.03 * min(chains, 10)
+//   breadth    = 1 + 0.02 * min(chains, 10)
 //                more chains mean more farming surface.
 //   implied    = max(1, round(tvl_usd * multiple * growthMult * maturity * breadth))
-//
-// Measured on the sealed snapshot, radar-3 moves 32 of the 40 watchlist
-// ranks against the starter's model (mean move 4.3 places, biggest 31),
-// while the top five stay put: no honest TVL model can move them, because
-// the biggest protocol holds 5.5x the fifth's TVL. What changes is the
-// order below them and the shape of the value curve — the board is no
-// longer a TVL table with a coat of paint.
 //
 // The board carries every slug on the snapshot's watchlist (the floor, never
 // the ceiling) plus the early pre-token protocols below the $50M floor, by
@@ -86,21 +72,21 @@ export interface RadarConstants {
 export const RADAR: RadarConstants = {
   base_multiple: 0.35,
   size_floor_usd: 50_000_000,
-  size_exponent: -0.25,
-  multiple_floor: 0.05,
-  growth_weight: 2.0,
+  size_exponent: -0.15,
+  multiple_floor: 0.1,
+  growth_weight: 1.0,
   growth_floor: -40,
   growth_cap: 60,
-  maturity_floor: 0.5,
-  maturity_range: 0.5,
+  maturity_floor: 0.6,
+  maturity_range: 0.4,
   maturity_days: 1095,
   unknown_age_days: 365,
-  breadth_per_chain: 0.03,
+  breadth_per_chain: 0.02,
   breadth_max_chains: 10,
 };
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-3';
+export const MODEL_VERSION = 'radar-2';
 
 /** How many early rows the board takes before filling with the rest, by TVL. */
 export const EARLY_ROWS = 260;
