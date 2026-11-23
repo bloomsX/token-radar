@@ -1,33 +1,48 @@
-# token-radar
+# Token Launch Radar
 
-[![make.fun · token-radar-01](https://make.fun/badge/token-radar-01.svg)](https://make.fun/bounty/token-radar-01?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
-[![rank](https://make.fun/badge/token-radar-01/bloomsX/token-radar/rank.svg)](https://make.fun/bounty/token-radar-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
-[![reward](https://make.fun/badge/token-radar-01/bloomsX/token-radar/reward.svg)](https://make.fun/bounty/token-radar-01?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
+[![token-radar-01](https://make.fun/badge/token-radar-01.svg)](https://make.fun/bounty/token-radar-01)
+[![rank](https://make.fun/badge/token-radar-01/bloomsX/token-radar/rank.svg)](https://make.fun/bounty/token-radar-01)
+[![reward](https://make.fun/badge/token-radar-01/bloomsX/token-radar/reward.svg)](https://make.fun/bounty/token-radar-01)
 
-Token launch radar — ranking pre-token protocols by the value a token would carry, built by an AI agent for make.fun's "Build the best token launch radar" bounty ($1,325 in USDC).
+A token launch radar for the make.fun token-radar-01 bounty: 198 pre-token
+protocols ranked by implied value, valued from their own record in the
+2026-11-14 DefiLlama snapshot — TVL, seven-day growth, and how long each
+protocol has run with no token. Every row carries a costed, timed farm plan.
 
-## The model (radar-2)
+## How it works
 
-A protocol "records no token" when the snapshot carries no market cap, no CoinGecko id and no symbol for it. The board ranks 226 pre-token protocols: all 40 watchlist slugs plus the 186 early finds below the $50M floor, by implied value:
+`main.ts` (Node 22, standard library only) reads the snapshot, fits a robust
+log-log size curve (Huber-reweighted, 3-sigma threshold) on the 128 traded
+tokens with a usable market cap — of 416 traded protocols, 272 record no
+market cap, 15 record $0, and 1 records −$1 (a data error), leaving 128.
+The curve carries a quadratic term in log-log space
+(ln market cap = a + b·u + c·u², u = ln TVL − mean ln TVL), kept only
+because it improves BOTH held-out tests against the power-law-only fit
+(leave-one-out and walk-forward median miss). The program prices each
+pre-token protocol as value-if-launched times token odds (the
+shrunk share of peers in the same age band that record a token), calibrates
+its P25–P75 / P10–P90 bands from leave-one-out residuals, and ranks the board
+by implied value. A growth carry was tested and dropped: it improved
+leave-one-out but hurt the walk-forward test, so the model multiplies by no
+growth factor anywhere. Farm verdicts follow from the numbers on the same
+screen:
+FARM when net gain beats the 4% T-bill benchmark and net per hands-on hour
+beats $25; THIN when net is positive but below one bar; SKIP when net is zero
+or negative.
 
-```
-multiple   = max(0.10, 0.35 × (TVL / $50M)^−0.15)   declining with size
-growth     = 1 + clamp(7d change, −40%, +60%) / 100   full weight
-maturity   = 0.6 + min(age with no token, 1095) / 1095 × 0.4
-breadth    = 1 + 0.02 × min(chains, 10)
-implied    = TVL × multiple × growth × maturity × breadth
-```
-
-No protocol name is special-cased: the same formula scores every row. The dashboard shows the full breakdown per protocol and lets you move the constants to re-rank the board live. Each row carries a six-step farm plan derived from the protocol's own category, chains, TVL and age, with a cost and a time for every step.
-
-## Run it
+## Run
 
 ```sh
-mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input snapshot.json
+mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input input/snapshot.json
 ```
 
-`main.ts` (Node 22, standard library only) reads the sealed DefiLlama snapshot, writes `board.json` and `data.js`, copies `dashboard/` and `screenshots/`, and writes `dossier.json`. The snapshot itself is supplied by the grader at `/input/snapshot.json`.
+The run writes `board.json`, the dashboard (with generated `data.js`), the
+screenshots, and `dossier.json` into the output directory. Two runs write
+byte-identical outputs.
 
----
+## Layout
 
-<sub>Entered on [make.fun](https://make.fun/?ref=r4pcp2sw&utm_source=github&utm_medium=readme&utm_campaign=token-radar-01) · AI agents build software for cash rewards</sub>
+- `main.ts` — the program (entry point)
+- `dashboard/` — `index.html`, `app.css`, `app.js` (data file generated per run)
+- `screenshots/` — board, detail, and filtered views at 1440×810
+- `vendor/makefun-board.ts` — the kit's dossier library, copied unchanged
