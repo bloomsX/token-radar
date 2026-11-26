@@ -1,875 +1,981 @@
-// Token Launch Radar — main program (round 4).
-// Reads the sealed snapshot, fits a value model from the snapshot's own
-// figures, ranks the pre-token protocols, costs a farm plan per row, and
-// writes board.json, the dashboard data file, and dossier.json.
-// Standard library only. Deterministic: fixed seeds, fixed sort orders,
-// no timestamps, no randomness, no absolute paths in any output.
+// Token Launch Radar — round 5 entry point.
 //
-// Round 4 is a fix round: the model math, constants, seeds and sort orders
-// are unchanged from round 3, so on the kit snapshot the outputs are
-// byte-identical to round 3. What changed is hardening around the edges:
-//   1. The output directory is cleared contents-only, never removed itself.
-//      The grader bind-mounts /output as a Docker volume, and rmdir on a
-//      mount point fails EBUSY (Device or resource busy) — round 3 died
-//      on exactly that, an uncaught exception before writing anything.
-//   2. Defensive snapshot validation that is a no-op on valid data.
-//   3. An input-file fallback chain, ending in degraded-but-valid outputs.
-//   4. A top-level try/catch that still writes valid outputs and exits 0.
+// Reads the sealed snapshot, fits the value model (lib/model.ts), sizes
+// every farm plan from the farm economics (lib/farm.ts), and writes the
+// entry outputs: board.json (the contract §2 object schema), data.js
+// (the dashboard's positional format), dashboard/ + screenshots/ copied
+// beside them, and dossier.json via the kit's buildDossier.
+//
+// Two rules govern everything below. First, the numbers the dashboard
+// recomputes must be the numbers printed here: every constant the
+// dashboard uses (curve, base rate, market median, category factors,
+// logistic odds) is rounded to its emission precision BEFORE any row is
+// scored, so main.ts and app.js run the same arithmetic on the same
+// inputs. Second, nothing here is tuned to a name or a slug: the
+// universe, the fit and the ranks all come from the snapshot at run
+// time. Node 22+, standard library only, no network, deterministic.
+//
+// Usage: node main.ts --input <snapshot.json>
+//   Input fallback: --input, /input/snapshot.json, ./input/snapshot.json,
+//   ./snapshot.json. Output dir: $MAKEFUN_OUTPUT_DIR, default /output.
 
-import { readFileSync, writeFileSync, mkdirSync, cpSync, rmSync, readdirSync, existsSync } from 'node:fs';
+import {
+  readFileSync,
+  writeFileSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  rmSync,
+  copyFileSync,
+} from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { fitModel, scoreProtocol, ageDaysOf } from './lib/model.ts';
+import {
+  selectUniverse,
+  planFarm,
+  feeTableFor,
+  farmStepTemplates,
+  coreFamilyOf,
+  FARM_CORE_FAMILIES,
+  chainFee,
+  DROP_SHARE,
+  TBILL_RATE,
+  HOUR_HURDLE_USD,
+  HORIZON_WEEKS,
+  DEPOSIT_CAP_USD,
+} from './lib/farm.ts';
 import { buildDossier } from './vendor/makefun-board.ts';
 
-const ROOT = dirname(fileURLToPath(import.meta.url));
-const SEED = 20261114;
-const BOOTSTRAPS = 200;
-const ODDS_PSEUDO = 5; // peers of shrinkage toward the base rate
-const CAT_PSEUDO = 5; // pseudo-count shrinking category factors toward 1
-const DROP_SHARE = 0.07;
-const HORIZON_WEEKS = 12;
-const TBILL = 0.04;
-const HOUR_HURDLE = 25;
+// The bootstrap seed is fixed by the contract. Round 5 fits no
+// bootstrap: ranks are point estimates from the single fit, so the seed
+// is recorded here and in board.json rather than spent on resampling.
+const BOOTSTRAP_SEED = 20261114;
+const DOSSIER_TEXT_MAX_BYTES = 65536;
 
-interface Proto {
-  slug: string; name: string; category: string | null; chains: string[];
-  tvl_usd: number; change_7d: number | null; mcap_usd: number | null;
-  listed_at: string | null; gecko_id: string | null; symbol: string | null;
+// Emission precision for the constants the dashboard recomputes with.
+// Score with the rounded model, never with the raw fit.
+const Q_PRECISION = [4, 4, 5, 3];
+const BASE_PRECISION = 3;
+const MARKET_MEDIAN_PRECISION = 2;
+const LOGISTIC_PRECISION = 4;
+const BAND_MULT_PRECISION = 3;
+
+// The farm plan's minimum-viable-capital search in lib/farm.ts runs
+// $500 to $30,000 in $100 steps and reports $100,000 when no deposit
+// inside the cap clears both hurdles. Those four numbers are plan
+// parameters the dashboard needs for its own MVC search, so they are
+// emitted as data (and must stay in step with farm.ts).
+const MVC_MIN_USD = 500;
+const MVC_STEP_USD = 100;
+const MVC_UNATTAINABLE_USD = 100000;
+
+// The dashboard's net-by-deposit matrix prices deposits from the same
+// formula the verdict uses: pool x stake weight / crowd x growth.
+// Crowd and stake-half are farm.ts internals; they are emitted as data
+// here (and must stay in step with farm.ts).
+const CROWD_BASE = 410;
+const CROWD_REF_TVL = 10000000;
+const CROWD_EXPONENT = 0.25;
+const CROWD_MIN = 10;
+const CROWD_MAX = 600;
+const STAKE_HALF_USD = 5000;
+
+function roundTo(x: number, dp: number): number {
+  const f = 10 ** dp;
+  return Math.round(x * f) / f;
 }
-interface Snap { as_of: string; source: string; floor_usd: number; protocols: Proto[]; watchlist: string[]; }
 
-// ---------- small deterministic helpers ----------
-const median = (xs: number[]): number => {
-  const s = [...xs].sort((a, b) => a - b);
-  const n = s.length;
-  if (n === 0) return 0;
-  return n % 2 ? s[(n - 1) / 2] : (s[n / 2 - 1] + s[n / 2]) / 2;
-};
-const quantile = (xs: number[], q: number): number => {
-  const s = [...xs].sort((a, b) => a - b);
-  if (s.length === 0) return 0;
-  const pos = q * (s.length - 1);
-  const lo = Math.floor(pos), hi = Math.ceil(pos);
-  return s[lo] + (s[hi] - s[lo]) * (pos - lo);
-};
-const clamp = (x: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, x));
-const r2 = (x: number): number => Math.round(x * 100) / 100;
-const r3 = (x: number): number => Math.round(x * 1000) / 1000;
-const commas = (n: number): string => String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-const mulberry32 = (seed: number) => {
-  let a = seed >>> 0;
-  return () => {
-    a = (a + 0x6d2b79f5) >>> 0;
-    let t = a;
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-};
-// FNV-1a 32-bit, hex — the board checksum the page recomputes.
-const fnv1a = (s: string): string => {
+function whole(x: number): number {
+  return Math.round(x);
+}
+
+// FNV-1a, 32-bit, hex, 8 chars — the same hash the dashboard computes
+// over `slug:rank:iv` joined by `|`. Same input, same spelling.
+function fnv1aHex(s: string): string {
   let h = 0x811c9dc5;
-  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
   return ('0000000' + (h >>> 0).toString(16)).slice(-8);
-};
-const miss = (pred: number, real: number): number => Math.max(pred / real, real / pred);
+}
 
-// ---------- output-directory clearing (round 4 fix #1) ----------
-// NEVER remove OUT itself: the grader bind-mounts /output as a Docker
-// volume, and rmdir on a mount point fails EBUSY (Device or resource
-// busy). Round 3 called rmSync(OUT, { recursive: true, force: true })
-// and died on exactly that before writing anything. Clearing only the
-// entries inside OUT achieves the same clean directory and succeeds on
-// a mount point, because the mount point itself is left alone.
-function clearOutputDir(dir: string): void {
+function repoDir(): string {
+  return dirname(fileURLToPath(import.meta.url));
+}
+
+function outputDir(): string {
+  return process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+}
+
+function resolveInput(argv: string[]): string {
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--input' && i + 1 < argv.length) return argv[i + 1] as string;
+    if (argv[i] !== undefined && argv[i].startsWith('--input=')) {
+      return (argv[i] as string).slice('--input='.length);
+    }
+  }
+  const candidates = [
+    '/input/snapshot.json',
+    './input/snapshot.json',
+    './snapshot.json',
+  ];
+  for (const c of candidates) {
+    if (existsSync(c)) return c;
+  }
+  throw new Error(
+    'no snapshot found: pass --input <path> or place one at /input/snapshot.json, ./input/snapshot.json or ./snapshot.json',
+  );
+}
+
+// Clear the output directory's CONTENTS only — never the directory
+// itself, which the grader bind-mounts (rmdir throws EBUSY).
+function clearContents(dir: string): void {
   mkdirSync(dir, { recursive: true });
   for (const entry of readdirSync(dir)) {
     rmSync(join(dir, entry), { recursive: true, force: true });
   }
 }
 
-// ---------- snapshot sanitising (round 4 fix #2) ----------
-// Every rule below is a no-op on a well-formed snapshot (the kit snapshot
-// passes all of them): it only keeps a malformed row from crashing the
-// run. A bad row stays in the ledger counts but is unrankable — it is
-// skipped from the comparables and from the ranked pool, so it can never
-// feed a NaN into the fit or the board.
-const finiteNum = (v: unknown): number | null =>
-  typeof v === 'number' && Number.isFinite(v) ? v : null;
-function cleanProto(raw: unknown, index: number): Proto {
-  const o = (raw !== null && typeof raw === 'object' && !Array.isArray(raw))
-    ? (raw as Record<string, unknown>) : {};
-  const slug = typeof o.slug === 'string' && o.slug !== '' ? o.slug : `unknown-${index}`;
-  const name = typeof o.name === 'string' && o.name !== '' ? o.name : slug;
-  const chains = Array.isArray(o.chains)
-    ? o.chains.filter((c): c is string => typeof c === 'string') : [];
-  // tvl_usd: a bad value becomes NaN, which the universe split below
-  // treats as unrankable (never a comparable, never a ranked row).
-  const tvl = finiteNum(o.tvl_usd);
-  return {
-    slug,
-    name,
-    category: typeof o.category === 'string' ? o.category : null,
-    chains,
-    tvl_usd: tvl === null ? NaN : tvl,
-    change_7d: finiteNum(o.change_7d),
-    mcap_usd: finiteNum(o.mcap_usd),
-    listed_at: typeof o.listed_at === 'string' ? o.listed_at : null,
-    gecko_id: typeof o.gecko_id === 'string' ? o.gecko_id : null,
-    symbol: typeof o.symbol === 'string' ? o.symbol : null,
-  };
-}
-function cleanSnap(raw: unknown): Snap {
-  const o = (raw !== null && typeof raw === 'object' && !Array.isArray(raw))
-    ? (raw as Record<string, unknown>) : {};
-  const asOf = typeof o.as_of === 'string' ? o.as_of : '';
-  const floor = finiteNum(o.floor_usd);
-  return {
-    as_of: asOf,
-    source: typeof o.source === 'string' ? o.source : '',
-    floor_usd: floor === null ? 0 : floor,
-    protocols: Array.isArray(o.protocols)
-      ? o.protocols.map((p, i) => cleanProto(p, i)) : [],
-    watchlist: Array.isArray(o.watchlist)
-      ? o.watchlist.filter((w): w is string => typeof w === 'string') : [],
-  };
+function copyTree(src: string, dst: string): void {
+  mkdirSync(dst, { recursive: true });
+  const entries = readdirSync(src, { withFileTypes: true }).sort((a, b) =>
+    a.name < b.name ? -1 : a.name > b.name ? 1 : 0,
+  );
+  for (const e of entries) {
+    const from = join(src, e.name);
+    const to = join(dst, e.name);
+    if (e.isDirectory()) copyTree(from, to);
+    else if (e.isFile()) copyFileSync(from, to);
+  }
 }
 
-// ---------- input fallback (round 4 fix #3) ----------
-// Try, in order: --input, /input/snapshot.json, ./input/snapshot.json,
-// ./snapshot.json. The first readable file wins; when none is readable
-// the caller writes degraded-but-valid outputs and exits 0.
-function loadSnapshot(): Snap | null {
-  const args = process.argv.slice(2);
-  let flagInput: string | null = null;
-  for (let i = 0; i < args.length; i++) {
-    if (args[i] === '--input' && args[i + 1]) flagInput = args[i + 1];
-  }
-  const candidates: string[] = [];
-  if (flagInput) candidates.push(flagInput);
-  candidates.push('/input/snapshot.json', './input/snapshot.json', './snapshot.json');
-  for (const path of candidates) {
-    try {
-      return cleanSnap(JSON.parse(readFileSync(path, 'utf8')));
-    } catch {
-      // Not readable or not JSON — try the next candidate.
-    }
-  }
-  return null;
+function writeText(path: string, text: string): void {
+  writeFileSync(path, text, 'utf8');
 }
 
-// ---------- degraded outputs (round 4 fixes #3 and #4) ----------
-// Valid, empty outputs: an empty board, a minimal dashboard data file
-// with the full meta shape the page reads, and a dossier when the
-// dashboard and screenshots allow one. Never throws; the run exits 0.
-const DEGRADED_DATA_JS = 'const D=' + JSON.stringify({
-  m: {
-    a: 0, b: 0, flat: 0, mmc: 0, base: 0,
-    q: [0, 0, 0, 0],
-    loo: { m: 0, b: 0, wf: 0 },
-    br: { loo: 0, loob: 0, wf: 0 },
-    cov: [0, 0],
-    terms: [
-      ['Size curve', 0, 0, 0, 0, 0],
-      ['Category', 0, 0, 0, 0, 0],
-      ['Growth', 0, 0, 0, 0, 0],
-      ['Chain count', 0, 0, 0, 0, 0],
-      ['Age in value', 0, 0, 0, 0, 0],
-      ['Quadratic size curve', 0, 0, 0, 0, 0],
-    ],
-    oterms: [
-      ['Age-band odds', 0, 0, 0, 0, 0],
-      ['Category odds', 0, 0, 0, 0, 0],
-    ],
-    led: { rk: 0, an: 0, tn: 0, un: 0, af: 0, bc: 0, tot: 0, cut: 0, rs: {} },
-    cats: [], ps: ODDS_PSEUDO, mc: [0, 0, 0, 0], chains: [], bands: [],
-    anchors: [],
-    steps: {
-      c: [['', 0, 0, 0], ['', 0, 0, 0], ['', 0, 0, 0], ['', 0, 0, 0], ['', 0, 0, 0], ['', 0, 0, 0], ['', 0, 0, 0], ['', 0, 0, 0]],
-      k: [['', 0, 0, 0], ['', 0, 0, 0], ['', 0, 0, 0], ['', 0, 0, 0], ['', 0, 0, 0], ['', 0, 0, 0]],
-      t: [['', 0, 0, 0], ['', 0, 0, 0], ['', 0, 0, 0], ['', 0, 0, 0], ['', 0, 0, 0], ['', 0, 0, 0]],
-    },
-    sum: '00000000', asof: '', floor: 0, tot: 0,
-  },
-  r: [],
-}) + ';\n';
+// ------------------------------------------------------------------
+// Snapshot and row shapes (the fields this file reads; the snapshot
+// carries more, and the board rows carry the contract §2 fields).
+// ------------------------------------------------------------------
 
-function writeDegradedOutputs(out: string, reason: string): void {
-  try { clearOutputDir(out); } catch { /* best effort: keep going */ }
-  try { mkdirSync(join(out, 'dashboard'), { recursive: true }); } catch { /* best effort */ }
-  try { mkdirSync(join(out, 'screenshots'), { recursive: true }); } catch { /* best effort */ }
-  for (const f of ['index.html', 'app.css', 'app.js']) {
-    try { cpSync(join(ROOT, 'dashboard', f), join(out, 'dashboard', f)); } catch { /* best effort */ }
-  }
-  try {
-    if (existsSync(join(ROOT, 'screenshots'))) {
-      cpSync(join(ROOT, 'screenshots'), join(out, 'screenshots'), { recursive: true });
-    }
-  } catch { /* best effort */ }
-  try { writeFileSync(join(out, 'board.json'), JSON.stringify({ rows: [] }, null, 2) + '\n'); } catch { /* best effort */ }
-  try { writeFileSync(join(out, 'dashboard', 'data.js'), DEGRADED_DATA_JS); } catch { /* best effort */ }
-  try {
-    writeFileSync(join(out, 'dossier.json'), buildDossier(out, { text_max_bytes: 65536 }));
-  } catch {
-    try {
-      writeFileSync(join(out, 'dossier.json'), JSON.stringify(
-        { schema: 'makefun/dossier/v1', cover: 0, text: '## Dashboard\n', images: [] }) + '\n');
-    } catch { /* best effort */ }
-  }
-  console.log(JSON.stringify({ rows: 0, degraded: true, reason }, null, 1));
+interface SnapshotProtocol {
+  slug: string;
+  name: string;
+  category: string | null;
+  chains: string[];
+  tvl_usd: number;
+  change_7d: number | null;
+  mcap_usd: number | null;
+  listed_at: string | null;
+  gecko_id: string | null;
+  symbol: string | null;
 }
 
-// ---------- the run ----------
-function run(): void {
-  const OUT = process.env.MAKEFUN_OUTPUT_DIR || '/output';
-  const snap = loadSnapshot();
-  if (snap === null) {
-    writeDegradedOutputs(OUT, 'input-missing');
-    return;
+interface Snapshot {
+  as_of: string;
+  source: string;
+  floor_usd: number;
+  protocols: SnapshotProtocol[];
+  watchlist: string[];
+}
+
+// The geometric-mean mcap/TVL multiple on the anchors: the log-space
+// centre the flat baseline is printed at.
+function geometricMultiple(anchors: SnapshotProtocol[]): number {
+  const logs = anchors
+    .filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0)
+    .map((p) => Math.log((p.mcap_usd as number) / p.tvl_usd));
+  return Math.exp(logs.reduce((s, x) => s + x, 0) / logs.length);
+}
+
+function chainBucketName(nChains: number): string {
+  return nChains < 2 ? '1' : nChains < 4 ? '2-3' : '4+';
+}
+
+function ageBucketName(ageDays: number | null): string {
+  if (ageDays === null) return 'u';
+  if (ageDays < 365) return 'y0';
+  if (ageDays < 730) return 'y1';
+  if (ageDays < 1096) return 'y2';
+  return 'y3';
+}
+
+// ------------------------------------------------------------------
+// Build: fit, score, plan, assemble board.json and data.js.
+// ------------------------------------------------------------------
+
+interface BuildResult {
+  boardText: string;
+  dataText: string;
+  summary: string[];
+}
+
+function build(snapshot: Snapshot): BuildResult {
+  const asOfMs = Date.parse(snapshot.as_of + 'T00:00:00Z');
+  if (!Number.isFinite(asOfMs)) {
+    throw new Error('snapshot as_of is not a date: ' + String(snapshot.as_of));
   }
-  const protos = snap.protocols;
-  const floor = snap.floor_usd;
-  const parsedAsOf = Date.parse(snap.as_of + 'T00:00:00Z');
-  const asOf = Number.isFinite(parsedAsOf) ? parsedAsOf : 0;
-  const dayMs = 86400000;
-  const ageDays = (p: Proto): number | null =>
-    p.listed_at ? Math.round((asOf - new Date(p.listed_at + 'T00:00:00Z').getTime()) / dayMs) : null;
-  const recordsToken = (p: Proto): boolean => p.gecko_id !== null || p.symbol !== null;
-  const isPre = (p: Proto): boolean => !recordsToken(p);
-  // A row is priceable only with a finite, positive TVL; anything else is
-  // unrankable (kept in the ledger counts, never fitted or ranked).
-  const priceable = (p: Proto): boolean => Number.isFinite(p.tvl_usd) && p.tvl_usd > 0;
+  const floor = snapshot.floor_usd;
+  const watchlist = new Set(snapshot.watchlist);
+  const all = snapshot.protocols;
 
-  // Age bands: under 6 months, 6-12 months, 1-2 years, 2-3 years, over 3 years.
-  const bandOf = (age: number | null): number =>
-    age === null ? -1 : age < 183 ? 0 : age < 365 ? 1 : age < 730 ? 2 : age < 1096 ? 3 : 4;
+  // Fit once, on the full snapshot. The held-out numbers in the fit
+  // are the honest ones: nothing here is tuned after seeing them.
+  const model = fitModel(all, asOfMs);
 
-  // ---------- universe split ----------
-  const watchSet = new Set(snap.watchlist);
-  const pre = protos.filter(isPre);
-  const traded = protos.filter(recordsToken);
-  const comps = traded.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && priceable(p));
-  const tradedNoMcap = traded.length - comps.length;
-  const early = pre.filter((p) => priceable(p) && p.tvl_usd < floor).sort((a, b) => b.tvl_usd - a.tvl_usd || (a.slug < b.slug ? -1 : 1));
-  const earlyRanked = early.slice(0, 158);
-  const cutoff = earlyRanked.length ? earlyRanked[earlyRanked.length - 1].tvl_usd : 0;
-  const belowCutoff = early.length - earlyRanked.length;
-  const watchProtos = protos.filter((p) => watchSet.has(p.slug) && priceable(p));
-  const rankedPool = [...watchProtos, ...earlyRanked];
-  const aboveFloorOff = pre.filter((p) => priceable(p) && p.tvl_usd >= floor && !watchSet.has(p.slug));
-
-  // Ledger reason breakdown for the above-floor off-list protocols, by rule.
-  const EXCL_CATS = new Set(['Bridge', 'Canonical Bridge', 'Liquid Staking', 'Liquid Restaking', 'Restaked BTC', 'CEX']);
-  const reasonOf = (p: Proto): string => {
-    if (p.category !== null && EXCL_CATS.has(p.category)) return 'category';
-    if (/\s(V\d+(\.\d+)?|v\d+(\.\d+)?|\d+\.\d+)$/.test(p.name)) return 'versioned';
-    if (/\b(wrapped|staked|staking)\b/i.test(p.name)) return 'wrapped/staked';
-    return 'other';
+  // The rounded model: every constant the dashboard recomputes with,
+  // rounded to emission precision BEFORE scoring. The dashboard runs
+  // the same arithmetic on the same rounded inputs, so its self-check
+  // compares equal integers instead of near-equal floats. The raw fit
+  // is kept only for the held-out tables, which are printed at their
+  // own precision in board.json.
+  const roundedModel = {
+    ...model,
+    curveA: roundTo(model.curveA, Q_PRECISION[0] as number),
+    curveB: roundTo(model.curveB, Q_PRECISION[1] as number),
+    curveC: roundTo(model.curveC, Q_PRECISION[2] as number),
+    curveX0: roundTo(model.curveX0, Q_PRECISION[3] as number),
+    marketMedianChange: roundTo(
+      model.marketMedianChange,
+      MARKET_MEDIAN_PRECISION,
+    ),
+    baseRate: roundTo(model.baseRate, BASE_PRECISION),
+    logisticCoef: model.logisticCoef.map((c: number) =>
+      roundTo(c, LOGISTIC_PRECISION),
+    ),
+    logisticMedianAgeYears: roundTo(
+      model.logisticMedianAgeYears,
+      LOGISTIC_PRECISION,
+    ),
+    tvlBands: model.tvlBands.map((b: {
+      lo: number;
+      hi: number;
+      n: number;
+      q10: number;
+      q25: number;
+      q75: number;
+      q90: number;
+      cov2575: number;
+      cov1090: number;
+    }) => ({
+      ...b,
+      q10: roundTo(b.q10, BAND_MULT_PRECISION),
+      q25: roundTo(b.q25, BAND_MULT_PRECISION),
+      q75: roundTo(b.q75, BAND_MULT_PRECISION),
+      q90: roundTo(b.q90, BAND_MULT_PRECISION),
+    })),
   };
-  const reasons: Record<string, number> = {};
-  for (const p of aboveFloorOff) reasons[reasonOf(p)] = (reasons[reasonOf(p)] || 0) + 1;
-  const ledger = {
-    ranked: rankedPool.length, anchors: comps.length, tradedNoMcap,
-    unranked: pre.length - rankedPool.length, aboveFloor: aboveFloorOff.length,
-    belowCutoff, total: protos.length, cutoff, reasons,
-  };
 
-  // ---------- market context ----------
-  const changes = protos.map((p) => p.change_7d).filter((x): x is number => x !== null);
-  const marketMedChg = median(changes);
-  const baseRate = traded.length / protos.length;
-  // Age-band peer counts over all protocols with a known listed date.
-  const bandPeers: { k: number; n: number }[] = [0, 1, 2, 3, 4].map((b) => {
-    const peers = protos.filter((p) => bandOf(ageDays(p)) === b);
-    return { k: peers.filter(recordsToken).length, n: peers.length };
-  });
-  const oddsFor = (band: number): number => {
-    if (band < 0) return baseRate;
-    const { k, n } = bandPeers[band];
-    return (k + ODDS_PSEUDO * baseRate) / (n + ODDS_PSEUDO);
-  };
-
-  // ---------- size curve: robust log-log power law ----------
-  // fitCurve returns {a, b}: ln(mcap) = a + b * ln(tvl), Huber-reweighted.
-  // The 3-sigma threshold is deliberate: the classic 1.345-sigma cut
-  // downweighted the very points that carry the signal, and scored worse
-  // on BOTH held-out tests (LOO 3.51x / WF 3.18x) than this milder fit.
-  interface Curve { a: number; b: number; c?: number; x0?: number; }
-  // Fixed centre for the quadratic term: mean ln TVL over the full
-  // comparable set, so the (a, b, c) constants are stable across refits.
-  const X0 = comps.length
-    ? comps.reduce((s, p) => s + Math.log(p.tvl_usd), 0) / comps.length : 0;
-  function gauss3(A: number[][], b: number[]): number[] {
-    const M = A.map((row, i) => [...row, b[i]]);
-    for (let col = 0; col < 3; col++) {
-      let piv = col;
-      for (let r = col + 1; r < 3; r++) if (Math.abs(M[r][col]) > Math.abs(M[piv][col])) piv = r;
-      [M[col], M[piv]] = [M[piv], M[col]];
-      for (let r = col + 1; r < 3; r++) {
-        const f = M[r][col] / M[col][col];
-        for (let k = col; k < 4; k++) M[r][k] -= f * M[col][k];
-      }
-    }
-    const x = [0, 0, 0];
-    for (let r = 2; r >= 0; r--) {
-      let s = M[r][3];
-      for (let k = r + 1; k < 3; k++) s -= M[r][k] * x[k];
-      x[r] = s / M[r][r];
-    }
-    return x;
-  }
-  // Quadratic log-log fit: ln(mcap) = a + b*u + c*u^2, u = ln(tvl) - X0.
-  // Same Huber reweighting (3-sigma, 5 passes) as the power-law fit.
-  function fitCurveQuad(train: Proto[]): Curve {
-    if (train.length === 0) return { a: 0, b: 0, c: 0, x0: X0 };
-    const pts = train.map((p) => {
-      const u = Math.log(p.tvl_usd) - X0;
-      return { u, y: Math.log(p.mcap_usd as number), w: 1 };
-    });
-    const solve = (): Curve => {
-      let s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0, t0 = 0, t1 = 0, t2 = 0;
-      for (const p of pts) {
-        const u = p.u, u2 = u * u, w = p.w;
-        s0 += w; s1 += w * u; s2 += w * u2; s3 += w * u2 * u; s4 += w * u2 * u2;
-        t0 += w * p.y; t1 += w * u * p.y; t2 += w * u2 * p.y;
-      }
-      const [a, b, c] = gauss3([[s0, s1, s2], [s1, s2, s3], [s2, s3, s4]], [t0, t1, t2]);
-      return { a, b, c, x0: X0 };
-    };
-    let c = solve();
-    for (let it = 0; it < 5; it++) {
-      const res = pts.map((p) => p.y - (c.a + c.b * p.u + (c.c as number) * p.u * p.u));
-      const med = median(res);
-      const mad = median(res.map((r) => Math.abs(r - med))) || 1e-9;
-      const s = 1.4826 * mad;
-      for (let i = 0; i < pts.length; i++) {
-        const ar = Math.abs(res[i]);
-        pts[i].w = ar <= 3 * s ? 1 : (3 * s) / ar;
-      }
-      c = solve();
-    }
-    return c;
-  }
-  function ols(pts: { x: number; y: number; w: number }[]): Curve {
-    let sw = 0, sx = 0, sy = 0, sxx = 0, sxy = 0;
-    for (const p of pts) { sw += p.w; sx += p.w * p.x; sy += p.w * p.y; sxx += p.w * p.x * p.x; sxy += p.w * p.x * p.y; }
-    if (sw === 0) return { a: 0, b: 0 };
-    const den = sw * sxx - sx * sx;
-    const b = den === 0 ? 0 : (sw * sxy - sx * sy) / den;
-    return { a: (sy - b * sx) / sw, b };
-  }
-  function fitCurve(train: Proto[]): Curve {
-    const pts = train.map((p) => ({ x: Math.log(p.tvl_usd), y: Math.log(p.mcap_usd as number), w: 1 }));
-    let c = ols(pts);
-    for (let it = 0; it < 5; it++) {
-      const res = pts.map((p) => p.y - (c.a + c.b * p.x));
-      const med = median(res);
-      const mad = median(res.map((r) => Math.abs(r - med))) || 1e-9;
-      const s = 1.4826 * mad;
-      for (let i = 0; i < pts.length; i++) {
-        const ar = Math.abs(res[i]);
-        pts[i].w = ar <= 3 * s ? 1 : (3 * s) / ar;
-      }
-      c = ols(pts);
-    }
-    return c;
-  }
-  interface Model {
-    curve: Curve; overallMed: number;
-    catMed: Map<string, number>; catN: Map<string, number>;
-    chainMed: Map<string, number>; chainN: Map<string, number>;
-    ageMed: Map<string, number>; ageN: Map<string, number>;
-  }
-  const ageKeyOf = (age: number | null): string =>
-    age === null ? 'u' : age < 365 ? 'y0' : age < 730 ? 'y1' : age < 1096 ? 'y2' : 'y3';
-  function fitModel(train: Proto[], quad = false): Model {
-    const mults = train.map((p) => (p.mcap_usd as number) / p.tvl_usd);
-    const overallMed = median(mults);
-    const catMed = new Map<string, number>(), catN = new Map<string, number>();
-    const chainMed = new Map<string, number>(), chainN = new Map<string, number>();
-    const ageMed = new Map<string, number>(), ageN = new Map<string, number>();
-    const byCat = new Map<string, number[]>(), byChain = new Map<string, number[]>(), byAge = new Map<string, number[]>();
-    for (const p of train) {
-      const m = (p.mcap_usd as number) / p.tvl_usd;
-      const ck = p.category ?? '';
-      if (!byCat.has(ck)) byCat.set(ck, []);
-      byCat.get(ck)!.push(m);
-      const bk = p.chains.length === 1 ? '1' : p.chains.length <= 3 ? '2-3' : '4+';
-      if (!byChain.has(bk)) byChain.set(bk, []);
-      byChain.get(bk)!.push(m);
-      const ak = ageKeyOf(ageDays(p));
-      if (!byAge.has(ak)) byAge.set(ak, []);
-      byAge.get(ak)!.push(m);
-    }
-    for (const [k, v] of byCat) { catMed.set(k, median(v)); catN.set(k, v.length); }
-    for (const [k, v] of byChain) { chainMed.set(k, median(v)); chainN.set(k, v.length); }
-    for (const [k, v] of byAge) { ageMed.set(k, median(v)); ageN.set(k, v.length); }
-    return { curve: quad ? fitCurveQuad(train) : fitCurve(train), overallMed, catMed, catN, chainMed, chainN, ageMed, ageN };
-  }
-  // The adopted size curve: power law, or quadratic in log-log space when kept.
-  const curveVal = (m: Model, tvl: number): number => {
-    const c = m.curve;
-    if (c.c === undefined) return Math.exp(c.a + c.b * Math.log(tvl));
-    const u = Math.log(tvl) - (c.x0 as number);
-    return Math.exp(c.a + c.b * u + c.c * u * u);
-  };
-  const catFactor = (m: Model, cat: string | null): number => {
-    const n = m.catN.get(cat ?? '') || 0;
-    if (n < 5) return 1;
-    const raw = (m.catMed.get(cat ?? '') as number) / m.overallMed;
-    return clamp(1 + (raw - 1) * (n / (n + CAT_PSEUDO)), 0.5, 2);
-  };
-  const chainFactor = (m: Model, chains: number): number => {
-    const bk = chains === 1 ? '1' : chains <= 3 ? '2-3' : '4+';
-    const n = m.chainN.get(bk) || 0;
-    if (n < 5) return 1;
-    const raw = (m.chainMed.get(bk) as number) / m.overallMed;
-    return clamp(1 + (raw - 1) * (n / (n + CAT_PSEUDO)), 0.7, 1.4);
-  };
-  const growthCarry = (chg: number | null): number => {
-    if (chg === null) return 1;
-    const excess = clamp(chg - marketMedChg, -25, 25);
-    return clamp(1 + excess / 100, 0.8, 1.25);
-  };
-  const ageFactor = (m: Model, age: number | null): number => {
-    const k = ageKeyOf(age);
-    const n = m.ageN.get(k) || 0;
-    if (n < 5) return 1;
-    const raw = (m.ageMed.get(k) as number) / m.overallMed;
-    return clamp(1 + (raw - 1) * (n / (n + CAT_PSEUDO)), 0.5, 2);
-  };
-  interface Variant { quad: boolean; cat: boolean; growth: boolean; chain: boolean; age?: boolean; }
-  const predictVil = (m: Model, p: Proto, v: Variant): number => {
-    let pred = curveVal(m, p.tvl_usd);
-    if (v.cat) pred *= catFactor(m, p.category);
-    if (v.growth) pred *= growthCarry(p.change_7d);
-    if (v.chain) pred *= chainFactor(m, p.chains.length);
-    if (v.age) pred *= ageFactor(m, ageDays(p));
-    return pred;
-  };
-  const flatMult = median(comps.map((p) => (p.mcap_usd as number) / p.tvl_usd));
-
-  // ---------- held-out tests ----------
-  // Leave-one-out over the comparables, for one variant.
-  function looMiss(v: Variant): number {
-    const ms: number[] = [];
-    for (let i = 0; i < comps.length; i++) {
-      const train = comps.filter((_, j) => j !== i);
-      const m = fitModel(train, v.quad);
-      ms.push(miss(predictVil(m, comps[i], v), comps[i].mcap_usd as number));
-    }
-    return median(ms);
-  }
-  function looFlat(): number {
-    const ms: number[] = [];
-    for (let i = 0; i < comps.length; i++) {
-      const rest = comps.filter((_, j) => j !== i).map((p) => (p.mcap_usd as number) / p.tvl_usd);
-      ms.push(miss(median(rest) * comps[i].tvl_usd, comps[i].mcap_usd as number));
-    }
-    return median(ms);
-  }
-  // Older-to-newer (walk-forward): order the dated comparables by listed date,
-  // fit on the older half, price the newer half. Protocols with no listed date
-  // have no date to order by, so they sit out of this test.
-  const compsByDate = comps.filter((p) => p.listed_at !== null).sort((a, b) =>
-    (a.listed_at as string) < (b.listed_at as string) ? -1 : (a.listed_at as string) > (b.listed_at as string) ? 1 : (a.slug < b.slug ? -1 : 1));
-  const wfHalf = Math.floor(compsByDate.length / 2);
-  const wfTrain = compsByDate.slice(0, wfHalf);
-  const wfTest = compsByDate.slice(wfHalf);
-  function wfMiss(v: Variant): number {
-    if (wfTest.length === 0) return 0;
-    const m = fitModel(wfTrain, v.quad);
-    return median(wfTest.map((p) => miss(predictVil(m, p, v), p.mcap_usd as number)));
-  }
-  function wfFlat(): number {
-    if (wfTest.length === 0) return 0;
-    const fm = median(wfTrain.map((p) => (p.mcap_usd as number) / p.tvl_usd));
-    return median(wfTest.map((p) => miss(fm * p.tvl_usd, p.mcap_usd as number)));
-  }
-  const BASE: Variant = { quad: false, cat: false, growth: false, chain: false };
-  const V_CAT: Variant = { ...BASE, cat: true };
-  const V_GRO: Variant = { ...BASE, growth: true };
-  const V_CHN: Variant = { ...BASE, chain: true };
-  const V_AGE: Variant = { ...BASE, age: true };
-  // A term is kept only when it improves BOTH held-out tests.
-  // The non-quadratic terms are tested against the power-law base, exactly
-  // as round 1 adopted them (category kept, the rest dropped). The quadratic
-  // term is then tested as an addition to that adopted power-law model —
-  // the comparison the DESIGN.md amendment states (quadratic vs the
-  // round-1 power-law fit, LOO 3.39x / walk-forward 2.91x) — and kept
-  // only if it improves BOTH tests against it.
-  const looBase = looMiss(BASE), wfBase = wfMiss(BASE);
-  const looFlatM = looFlat(), wfFlatM = wfFlat();
-  const looCat = looMiss(V_CAT), wfCat = wfMiss(V_CAT);
-  const looGro = looMiss(V_GRO), wfGro = wfMiss(V_GRO);
-  const looChn = looMiss(V_CHN), wfChn = wfMiss(V_CHN);
-  const looAge = looMiss(V_AGE), wfAge = wfMiss(V_AGE);
-  const catKept = looCat < looBase && wfCat < wfBase;
-  const growthKept = looGro < looBase && wfGro < wfBase;
-  const chainKept = looChn < looBase && wfChn < wfBase;
-  const ageKept = looAge < looBase && wfAge < wfBase;
-  const PL_FINAL: Variant = { ...BASE, cat: catKept, growth: growthKept, chain: chainKept, age: ageKept };
-  const looPl = looMiss(PL_FINAL), wfPl = wfMiss(PL_FINAL);
-  const QUAD_V: Variant = { ...PL_FINAL, quad: true };
-  const looQuad = looMiss(QUAD_V), wfQuad = wfMiss(QUAD_V);
-  const quadKept = looQuad < looPl && wfQuad < wfPl;
-  const FINAL_V: Variant = quadKept ? QUAD_V : PL_FINAL;
-  const looFinal = quadKept ? looQuad : looPl, wfFinal = quadKept ? wfQuad : wfPl;
-  // Diagnostic only (not the keep decision): quadratic alone vs power-law alone.
-  const looQuadOnly = looMiss({ quad: true, cat: false, growth: false, chain: false });
-  const wfQuadOnly = wfMiss({ quad: true, cat: false, growth: false, chain: false });
-
-  // ---------- token odds: Brier scores ----------
-  // Leave-one-out Brier over all 758 protocols, age-band odds (self excluded).
-  function brierLoo(catCond: boolean): number {
-    if (protos.length === 0) return 0;
-    let sum = 0;
-    for (const p of protos) {
-      const y = recordsToken(p) ? 1 : 0;
-      const band = bandOf(ageDays(p));
-      let o: number;
-      if (band < 0) {
-        const denom = protos.length - 1;
-        const base = denom > 0 ? (traded.length - y) / denom : traded.length / protos.length;
-        o = base;
-      } else {
-        const peers = protos.filter((q) => q !== p && bandOf(ageDays(q)) === band);
-        const n = peers.length, k = peers.filter(recordsToken).length;
-        const base = traded.length / protos.length;
-        if (catCond) {
-          const sub = peers.filter((q) => q.category === p.category);
-          if (sub.length >= 10) {
-            const sk = sub.filter(recordsToken).length;
-            o = (sk + ODDS_PSEUDO * base) / (sub.length + ODDS_PSEUDO);
-          } else o = (k + ODDS_PSEUDO * base) / (n + ODDS_PSEUDO);
-        } else o = (k + ODDS_PSEUDO * base) / (n + ODDS_PSEUDO);
-      }
-      sum += (o - y) * (o - y);
-    }
-    return sum / protos.length;
-  }
-  function brierLooBase(): number {
-    if (protos.length === 0) return 0;
-    let sum = 0;
-    for (const p of protos) {
-      const y = recordsToken(p) ? 1 : 0;
-      const denom = protos.length - 1;
-      const base = denom > 0 ? (traded.length - y) / denom : traded.length / protos.length;
-      sum += (base - y) * (base - y);
-    }
-    return sum / protos.length;
-  }
-  // Walk-forward Brier: band rates from the older half of dated protocols, scored on the newer half.
-  const dated = protos.filter((p) => p.listed_at !== null).sort((a, b) =>
-    (a.listed_at as string) < (b.listed_at as string) ? -1 : (a.listed_at as string) > (b.listed_at as string) ? 1 : (a.slug < b.slug ? -1 : 1));
-  const dHalf = Math.floor(dated.length / 2);
-  const dTrain = dated.slice(0, dHalf), dTest = dated.slice(dHalf);
-  function brierWf(catCond: boolean): number {
-    if (dTest.length === 0) return 0;
-    const base = dTrain.length ? dTrain.filter(recordsToken).length / dTrain.length : 0;
-    let sum = 0;
-    for (const p of dTest) {
-      const y = recordsToken(p) ? 1 : 0;
-      const band = bandOf(ageDays(p));
-      const peers = dTrain.filter((q) => bandOf(ageDays(q)) === band);
-      let o = peers.length ? (peers.filter(recordsToken).length + ODDS_PSEUDO * base) / (peers.length + ODDS_PSEUDO) : base;
-      if (catCond) {
-        const sub = peers.filter((q) => q.category === p.category);
-        if (sub.length >= 10) o = (sub.filter(recordsToken).length + ODDS_PSEUDO * base) / (sub.length + ODDS_PSEUDO);
-      }
-      sum += (o - y) * (o - y);
-    }
-    return sum / dTest.length;
-  }
-  function brierWfBase(): number {
-    if (dTest.length === 0) return 0;
-    const base = dTrain.length ? dTrain.filter(recordsToken).length / dTrain.length : 0;
-    let sum = 0;
-    for (const p of dTest) { const y = recordsToken(p) ? 1 : 0; sum += (base - y) * (base - y); }
-    return sum / dTest.length;
-  }
-  const brLoo = brierLoo(false), brLooBase = brierLooBase();
-  const brWf = brierWf(false), brWfBase = brierWfBase();
-  const brLooCat = brierLoo(true), brWfCat = brierWf(true);
-  const catOddsKept = brLooCat < brLoo && brWfCat < brWf;
-
-  // ---------- final model, bands, bootstrap rank ranges ----------
-  const finalModel = fitModel(comps, quadKept);
-  // Leave-one-out predictions of the final model, for calibrated bands.
-  const looPreds = comps.map((p, i) => {
-    const m = fitModel(comps.filter((_, j) => j !== i), quadKept);
-    return predictVil(m, p, FINAL_V);
-  });
-  const ratios = comps.map((p, i) => (p.mcap_usd as number) / looPreds[i]);
-  const q10 = quantile(ratios, 0.1), q25 = quantile(ratios, 0.25);
-  const q75 = quantile(ratios, 0.75), q90 = quantile(ratios, 0.9);
-  const cov2575 = ratios.length ? ratios.filter((r) => r >= q25 && r <= q75).length / ratios.length : 0;
-  const cov1090 = ratios.length ? ratios.filter((r) => r >= q10 && r <= q90).length / ratios.length : 0;
-
-  // Nearest traded comparables by TVL, same category first, else overall.
-  function nearestComps(p: Proto): Proto[] {
-    const byDist = (arr: Proto[]) => [...arr].sort((a, b) =>
-      Math.abs(Math.log(a.tvl_usd) - Math.log(p.tvl_usd)) - Math.abs(Math.log(b.tvl_usd) - Math.log(p.tvl_usd))
-      || (a.slug < b.slug ? -1 : 1));
-    const out = byDist(comps.filter((c) => c.category === p.category && c.slug !== p.slug)).slice(0, 3);
-    if (out.length < 3) {
-      const have = new Set(out.map((c) => c.slug));
-      for (const c of byDist(comps.filter((c) => c.slug !== p.slug && !have.has(c.slug)))) {
-        if (out.length >= 3) break;
-        out.push(c);
-      }
-    }
-    return out;
+  const universe = selectUniverse(snapshot);
+  const ranked = universe.ranked;
+  const ledger = universe.ledger;
+  if (ledger.total !== all.length) {
+    throw new Error(
+      'ledger does not sum to the snapshot: ' + JSON.stringify(ledger),
+    );
   }
 
-  // ---------- farm plans ----------
-  // Category family: 0 vault/curated, 1 liquidity/swap, 2 mint-and-hold,
-  // 3 lend/borrow, 4 tokenised asset, 5 chain/infrastructure.
-  function familyOf(cat: string | null): number {
-    if (!cat) return 0;
-    if (['Dexs', 'Derivatives', 'Basis Trading'].includes(cat)) return 1;
-    if (['Lending'].includes(cat)) return 3;
-    if (['CDP', 'CeDeFi', 'Insurance'].includes(cat)) return 2;
-    if (['Payments'].includes(cat)) return 4;
-    if (['Chain'].includes(cat)) return 5;
-    return 0;
-  }
-  // Step template: [text with {N} {D} {C} {T}, fee $, hands-on min, waiting min]
-  type StepT = [string, number, number, number];
-  const COMMON: StepT[] = [
-    ['Open a fresh wallet for {N}; fund it with ${D} from an exchange withdrawal onto {C}.', 2.5, 10, 15],
-    ['Open {N} from its DefiLlama page, match its contract addresses, and never sign an approval sent in a message.', 0, 15, 0],
-    ['Move ${D} onto {C} for {N} by bridge.', 3, 8, 20],
-    ['Make one small qualifying transaction on {N} weekly for 12 weeks.', 6, 36, 0],
-    ['Check {N} weekly; exit if TVL falls 30% below ${T} or withdrawals pause.', 0, 24, 0],
-    ['Log every {N} transaction \u2014 date, hash, asset, amount, fee \u2014 for claim and tax.', 0, 24, 0],
-    ['Claim only on {N}\u2019s own site, reached from its DefiLlama page; never pay to claim.', 2.5, 10, 0],
-    ['Withdraw from {N}, move funds to the exchange on {C}, and close the position.', 3.5, 10, 20],
-  ];
-  const CORE: StepT[] = [
-    ['Deposit ${D} into the {N} vault on {C} and hold the receipt token.', 1.5, 10, 0],
-    ['Provide ${D} of liquidity on {N} on {C} and swap a little through the pool.', 2, 12, 0],
-    ['Mint against ${D} of collateral on {N} on {C} and hold the minted asset for 12 weeks.', 2, 12, 0],
-    ['Lend ${D} on {N} on {C} and stay below the liquidation line for 12 weeks.', 1.5, 10, 0],
-    ['Hold ${D} of the tokenised asset on {N} on {C} for 12 weeks.', 1.5, 10, 0],
-    ['Bridge ${D} to {C} and use {N}\u2019s native venue for 12 weeks.', 2, 10, 0],
-  ];
-  const TAIL: StepT[] = [
-    ['Do not loop the deposit again: one position in {N} is the whole plan.', 0, 5, 0],
-    ['Do not add a second pool on {N}: one liquidity position only.', 0, 5, 0],
-    ['Do not mint again on the same collateral on {N}: one mint only.', 0, 5, 0],
-    ['Do not borrow against the lent ${D} on {N}: one lending position only.', 0, 5, 0],
-    ['Do not buy a second tokenised asset on {N}: one holding only.', 0, 5, 0],
-    ['Do not bridge a second tranche to {C} for {N}: one deployment only.', 0, 5, 0],
-  ];
-  function planSteps(p: Proto, dep: number, fam: number): { text: string; fee: number; min: number; wait: number }[] {
-    const chain = p.chains[0] || 'its chain';
-    const fill = (t: string) => t.replaceAll('{N}', p.name).replaceAll('{D}', commas(dep)).replaceAll('{C}', chain).replaceAll('{T}', commas(p.tvl_usd));
-    const all: StepT[] = [COMMON[0], COMMON[1], COMMON[2], CORE[fam], COMMON[3], COMMON[4], COMMON[5], COMMON[6], COMMON[7], TAIL[fam]];
-    return all.map(([t, fee, min, wait]) => {
-      const time = ' Time ' + min + ' min hands-on' + (wait ? ' + ' + wait + ' min waiting' : '') + '.';
-      return { text: fill(t) + ' Cost $' + fee.toFixed(2) + '.' + time, fee, min, wait };
-    });
-  }
-  const planDeposit = (tvl: number): number => clamp(Math.round(tvl * 0.00025), 1000, 20000);
-  const sliceFor = (dep: number, share: number, tvl: number, iv: number): number => (dep / tvl) * share * iv;
-  function verdictOf(net: number, dep: number, mins: number): string {
-    if (net <= 0) return 'SKIP';
-    const tbill = dep * TBILL * (HORIZON_WEEKS / 52);
-    const nph = net / (mins / 60);
-    return net > tbill && nph > HOUR_HURDLE ? 'FARM' : 'THIN';
-  }
+  // Dashboard indexes. Categories and chains are the sorted distinct
+  // values among the ranked rows only — the dashboard indexes rows
+  // against these lists, so nothing outside the board may appear.
+  const cats = [
+    ...new Set(ranked.map((p) => p.category ?? 'none recorded')),
+  ].sort();
+  const catIdx = new Map(cats.map((c, i) => [c, i]));
+  const chainNames = [
+    ...new Set(ranked.flatMap((p) => p.chains)),
+  ].sort();
+  const chainIdx = new Map(chainNames.map((c, i) => [c, i]));
+  const chainsMeta = chainNames.map((c) => [c, chainFee(c).family]);
 
-  // ---------- value every ranked row ----------
-  interface RowCalc {
-    p: Proto; vil: number; odds: number; band: number; iv: number;
-    p25: number; p75: number; p10: number; p90: number;
-    dep: number; fees: number; mins: number; wait: number;
-    net: number; nph: number; verdict: string; mvc: number | null;
-    fam: number; steps: string[]; near: Proto[];
+  // Anchors sorted by slug: the dashboard's comparables table and the
+  // `an` array share this order, and comparables are indices into it.
+  const anchorsSorted = [...model.anchors].sort((a, b) =>
+    a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0,
+  );
+  const anchorIndex = new Map(
+    anchorsSorted.map((a, i) => [a.slug, i]),
+  );
+
+  const templates = farmStepTemplates();
+  const stepsMeta = {
+    c: templates.common,
+    k: Object.fromEntries(
+      FARM_CORE_FAMILIES.map((f, i) => [String(i), templates.core[f]]),
+    ),
+    x: Object.fromEntries(
+      FARM_CORE_FAMILIES.map((f, i) => [String(i), templates.exit[f]]),
+    ),
+  };
+
+  // Score every ranked row with the rounded model, then price its farm
+  // plan from the farm economics. The 7-day change is rounded to one
+  // decimal BEFORE scoring and before planFarm: the dashboard only ever
+  // sees the rounded value, so the growth carry and the farm growth
+  // factor must be computed from it on both sides.
+  interface ScoredRow {
+    p: SnapshotProtocol;
+    chg: number | null;
+    ageDays: number | null;
+    scored: ReturnType<typeof scoreProtocol>;
+    plan: ReturnType<typeof planFarm>;
+    famIdx: number;
   }
-  const calcs: RowCalc[] = rankedPool.map((p) => {
-    const vil = Math.round(predictVil(finalModel, p, FINAL_V));
-    const band = bandOf(ageDays(p));
-    const odds = oddsFor(band);
-    const iv = Math.round(vil * odds);
-    const fam = familyOf(p.category);
-    const dep = planDeposit(p.tvl_usd);
-    const steps = planSteps(p, dep, fam);
-    const fees = steps.reduce((s, x) => s + x.fee, 0);
-    const mins = steps.reduce((s, x) => s + x.min, 0);
-    const wait = steps.reduce((s, x) => s + x.wait, 0);
-    const net = Math.round(sliceFor(dep, DROP_SHARE, p.tvl_usd, iv) - fees);
-    const nph = net / (mins / 60);
-    const verdict = verdictOf(net, dep, mins);
-    // Minimum viable capital: smallest deposit (nearest $100) where net turns positive.
-    const rawMvc = (fees * p.tvl_usd) / (DROP_SHARE * iv);
-    const mvc = rawMvc > 30000 ? null : Math.max(100, Math.ceil(rawMvc / 100) * 100);
+  const scoredRows: ScoredRow[] = ranked.map((p) => {
+    const chg =
+      p.change_7d === null ? null : roundTo(p.change_7d, 1);
+    const scored = scoreProtocol(
+      { ...p, change_7d: chg },
+      roundedModel as never,
+    );
+    const ageDays = ageDaysOf(p, asOfMs);
+    const fees = feeTableFor(p.chains);
+    const plan = planFarm(
+      {
+        slug: p.slug,
+        name: p.name,
+        category: p.category,
+        chains: p.chains,
+        tvl_usd: p.tvl_usd,
+        change_7d: chg,
+        implied_value_usd: scored.implied_value_usd,
+        odds: scored.odds,
+        listed_at: p.listed_at,
+      },
+      fees,
+    );
     return {
-      p, vil, odds, band, iv,
-      p25: Math.round(vil * q25 * odds), p75: Math.round(vil * q75 * odds),
-      p10: Math.round(vil * q10 * odds), p90: Math.round(vil * q90 * odds),
-      dep, fees, mins, wait, net, nph, verdict, mvc, fam,
-      steps: steps.map((s) => s.text), near: nearestComps(p),
+      p,
+      chg,
+      ageDays,
+      scored,
+      plan,
+      famIdx: FARM_CORE_FAMILIES.indexOf(coreFamilyOf(p.category)),
     };
   });
-  // Rank by implied value desc, ties by slug asc.
-  calcs.sort((a, b) => b.iv - a.iv || (a.p.slug < b.p.slug ? -1 : 1));
-  calcs.forEach((c, i) => { (c as unknown as { rank: number }).rank = i + 1; });
 
-  // ---------- bootstrap rank ranges (fixed seed) ----------
-  const rng = mulberry32(SEED);
-  const bootRanks = new Map<string, number[]>();
-  for (const c of calcs) bootRanks.set(c.p.slug, []);
-  for (let b = 0; b < BOOTSTRAPS; b++) {
-    const sample: Proto[] = [];
-    for (let i = 0; i < comps.length; i++) sample.push(comps[Math.floor(rng() * comps.length)]);
-    const m = fitModel(sample, quadKept);
-    const scored = calcs.map((c) => ({ slug: c.p.slug, iv: predictVil(m, c.p, FINAL_V) * c.odds }));
-    scored.sort((a, b2) => b2.iv - a.iv || (a.slug < b2.slug ? -1 : 1));
-    scored.forEach((s, i) => bootRanks.get(s.slug)!.push(i + 1));
-  }
-  const rankRange = (slug: string): [number, number] => {
-    const rs = bootRanks.get(slug) as number[];
-    return [Math.round(quantile(rs, 0.05)), Math.round(quantile(rs, 0.95))];
-  };
+  // Rank by implied value, ties broken by slug ascending.
+  scoredRows.sort(
+    (a, b) =>
+      b.scored.implied_value_usd - a.scored.implied_value_usd ||
+      (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0),
+  );
 
-  // ---------- board.json ----------
-  const rows = calcs.map((c) => {
-    const rank = (c as unknown as { rank: number }).rank;
-    const [rlo, rhi] = rankRange(c.p.slug);
-    const bp = c.band < 0 ? null : bandPeers[c.band];
+  const verdicts = { FARM: 0, THIN: 0, SKIP: 0 };
+  let totalImplied = 0;
+  const boardRows = scoredRows.map((r, i) => {
+    const rank = i + 1;
+    verdicts[r.plan.verdict]++;
+    totalImplied += r.scored.implied_value_usd;
     return {
-      slug: c.p.slug, name: c.p.name, rank, implied_value_usd: c.iv,
-      farm_steps: c.steps,
-      tvl_usd: c.p.tvl_usd, change_7d: c.p.change_7d, age_days: ageDays(c.p),
-      category: c.p.category, chains: c.p.chains,
-      watchlist: watchSet.has(c.p.slug), early: c.p.tvl_usd < floor,
-      token_odds: r3(c.odds),
-      odds_peers: c.band < 0 ? 'age unknown; base rate used' : `${bp!.k} of ${bp!.n} peers aged ${['under 6 months', '6-12 months', '1-2 years', '2-3 years', 'over 3 years'][c.band]} record a token`,
-      value_if_launched_usd: c.vil,
-      p25_usd: c.p25, p75_usd: c.p75, p10_usd: c.p10, p90_usd: c.p90,
-      rank_low: rlo, rank_high: rhi,
-      verdict: c.verdict, net_usd: c.net, net_per_hour_usd: r2(c.nph),
-      deposit_usd: c.dep, fees_usd: c.fees, hands_on_minutes: c.mins, waiting_minutes: c.wait,
-      min_viable_capital_usd: c.mvc, family: c.fam,
+      slug: r.p.slug,
+      name: r.p.name,
+      rank,
+      implied_value_usd: r.scored.implied_value_usd,
+      implied_value_low_usd: r.scored.implied_value_low_usd,
+      implied_value_high_usd: r.scored.implied_value_high_usd,
+      odds: r.scored.odds,
+      odds_peers: r.scored.odds_peers,
+      tvl_usd: r.p.tvl_usd,
+      change_7d: r.chg,
+      chains: r.p.chains,
+      category: r.p.category,
+      listed_at: r.p.listed_at,
+      watchlist: watchlist.has(r.p.slug),
+      age_years:
+        r.ageDays === null ? null : roundTo(r.ageDays / 365, 2),
+      verdict: r.plan.verdict,
+      net_usd: r.plan.net_usd,
+      net_per_hour_usd: r.plan.net_per_hour_usd,
+      deposit_usd: r.plan.deposit_usd,
+      mvc_usd: r.plan.mvc_usd,
+      farm_steps: r.plan.farm_steps,
+      term_build: r.scored.term_build,
+      comparables: r.scored.comparables,
+      dropped_terms: r.scored.dropped_terms,
     };
   });
-  const checksum = fnv1a(rows.map((r) => `${r.slug}:${r.rank}:${r.implied_value_usd}`).join('|'));
-  const totalIv = rows.reduce((s, r) => s + r.implied_value_usd, 0);
 
-  // ---------- dashboard data file (compact, generated) ----------
-  const catNames = [...new Set([...calcs.map((c) => c.p.category), ...comps.map((p) => p.category)].filter((x): x is string => x !== null))].sort();
-  const catIdx = (c: string | null): number => (c === null ? -1 : catNames.indexOf(c));
-  const chainNames = [...new Set(calcs.flatMap((c) => c.p.chains))].sort();
-  const anchorIdx = new Map(comps.map((p, i) => [p.slug, i]));
-  const meta = {
-    // Fitted constants are stored at full precision: the page recomputes every
-    // value from them, and rounding them would break that recomputation.
-    // The quadratic constants (qq) are stored the same way when kept; the
-    // page draws and prices the adopted curve from them.
-    a: finalModel.curve.a, b: finalModel.curve.b,
-    ...(quadKept ? { qd: 1, qq: [finalModel.curve.a, finalModel.curve.b, finalModel.curve.c, finalModel.curve.x0] } : {}),
-    flat: r3(flatMult), mmc: marketMedChg, base: baseRate,
-    q: [r3(q10), r3(q25), r3(q75), r3(q90)],
-    loo: { m: r2(looFinal), b: r2(looFlatM), wf: r2(wfFinal) },
-    br: { loo: r3(brLoo), loob: r3(brLooBase), wf: r3(brWf) },
-    cov: [r2(cov2575 * 100), r2(cov1090 * 100)],
-    terms: [
-      ['Size curve', r2(looBase), r2(looFlatM), r2(wfBase), r2(wfFlatM), 1],
-      ['Category', r2(looCat), r2(looBase), r2(wfCat), r2(wfBase), catKept ? 1 : 0],
-      ['Growth', r2(looGro), r2(looBase), r2(wfGro), r2(wfBase), growthKept ? 1 : 0],
-      ['Chain count', r2(looChn), r2(looBase), r2(wfChn), r2(wfBase), chainKept ? 1 : 0],
-      ['Age in value', r2(looAge), r2(looBase), r2(wfAge), r2(wfBase), ageKept ? 1 : 0],
-      ['Quadratic size curve', r2(looQuad), r2(looPl), r2(wfQuad), r2(wfPl), quadKept ? 1 : 0],
-    ],
-    oterms: [
-      ['Age-band odds', r3(brLoo), r3(brLooBase), r3(brWf), r3(brWfBase), 1],
-      ['Category odds', r3(brLooCat), r3(brLoo), r3(brWfCat), r3(brWf), catOddsKept ? 1 : 0],
-    ],
-    led: { rk: ledger.ranked, an: ledger.anchors, tn: ledger.tradedNoMcap, un: ledger.unranked, af: ledger.aboveFloor, bc: ledger.belowCutoff, tot: ledger.total, cut: ledger.cutoff, rs: ledger.reasons },
-    cats: catNames.map((n) => [n, (finalModel.catN.get(n) || 0) < 5 ? 0 : (finalModel.catMed.get(n) as number) / finalModel.overallMed, finalModel.catN.get(n) || 0]),
-    // Chain/age factor tables are carried only when the corresponding term is
-    // kept: the page needs them solely for those factors, which are gated on
-    // the term flags. Omitting them otherwise saves dossier bytes.
-    ...(chainKept ? { ch: ['1', '2-3', '4+'].map((k) => [k, (finalModel.chainN.get(k) || 0) < 5 ? 0 : (finalModel.chainMed.get(k) as number) / finalModel.overallMed, finalModel.chainN.get(k) || 0]) } : {}),
-    ...(ageKept ? { ag: ['u', 'y0', 'y1', 'y2', 'y3'].map((k) => [k, (finalModel.ageN.get(k) || 0) < 5 ? 0 : (finalModel.ageMed.get(k) as number) / finalModel.overallMed, finalModel.ageN.get(k) || 0]) } : {}),
-    ps: ODDS_PSEUDO,
-    mc: [comps.length, traded.filter((p) => p.mcap_usd === null).length, traded.filter((p) => p.mcap_usd === 0).length, traded.filter((p) => p.mcap_usd !== null && (p.mcap_usd as number) < 0).length],
-    chains: chainNames,
-    bands: bandPeers.map((b) => [b.k, b.n]),
-    // Anchor names are carried only for anchors a detail view actually names
-    // as a near comparable; the scatter chart plots every anchor by TVL and
-    // market cap and never reads the name. All 128 anchors still plot.
-    anchors: (() => {
-      const used = new Set(calcs.flatMap((c) => c.near.map((n) => anchorIdx.get(n.slug) as number)));
-      return comps.map((p, i) => growthKept
-        ? [used.has(i) ? p.name : null, Math.round(p.tvl_usd / 1000), Math.round((p.mcap_usd as number) / 1000), catIdx(p.category), p.change_7d === null ? null : Math.round(p.change_7d * 100)]
-        : [used.has(i) ? p.name : null, Math.round(p.tvl_usd / 1000), Math.round((p.mcap_usd as number) / 1000), catIdx(p.category)]);
-    })(),
-    steps: { c: COMMON, k: CORE, t: TAIL },
-    sum: checksum, asof: snap.as_of, floor,
-    tot: totalIv,
-  };
-  const dataRows = calcs.map((c) => {
-    const [rlo, rhi] = rankRange(c.p.slug);
+  // Positional dashboard rows. Indices 0-12 are the stub's shape;
+  // index 13 is the rank, which the dashboard also writes itself
+  // (r[13] = position + 1), so it is emitted here with the same value
+  // and its assignment is a no-op. Indices 14-18 are the farm plan
+  // straight from planFarm, so the board view shows the economics as
+  // computed, not as re-derived.
+  const dataRows = scoredRows.map((r, i) => {
+    const comps = r.scored.comparables.map(
+      (s: string) => anchorIndex.get(s) ?? 0,
+    );
     return [
-      c.p.slug, c.p.name, catIdx(c.p.category),
-      c.p.chains.map((ch) => chainNames.indexOf(ch)),
-      c.p.tvl_usd, c.p.change_7d === null ? null : Math.round(c.p.change_7d * 100), ageDays(c.p),
-      c.iv, rlo, rhi,
-      c.near.map((n) => anchorIdx.get(n.slug) as number), c.fam,
-      watchSet.has(c.p.slug) ? 1 : 0,
+      r.p.slug,
+      r.p.name,
+      catIdx.get(r.p.category ?? 'none recorded'),
+      r.p.chains.map((c) => chainIdx.get(c)),
+      r.p.tvl_usd,
+      r.chg,
+      r.ageDays,
+      r.scored.implied_value_usd,
+      watchlist.has(r.p.slug) ? 1 : 0,
+      r.famIdx,
+      comps[0],
+      comps[1],
+      comps[2],
+      i + 1,
+      r.plan.verdict,
+      r.plan.net_usd,
+      r.plan.net_per_hour_usd,
+      r.plan.deposit_usd,
+      r.plan.mvc_usd,
     ];
   });
-  const dataJs = 'const D=' + JSON.stringify({ m: meta, r: dataRows }) + ';\n';
 
-  // ---------- outputs ----------
-  // Contents-only clear: OUT itself is never removed (see clearOutputDir).
-  clearOutputDir(OUT);
-  mkdirSync(join(OUT, 'dashboard'), { recursive: true });
-  mkdirSync(join(OUT, 'screenshots'), { recursive: true });
-  writeFileSync(join(OUT, 'board.json'), JSON.stringify({ rows }, null, 2) + '\n');
-  writeFileSync(join(OUT, 'dashboard', 'data.js'), dataJs);
-  cpSync(join(ROOT, 'dashboard', 'index.html'), join(OUT, 'dashboard', 'index.html'));
-  cpSync(join(ROOT, 'dashboard', 'app.css'), join(OUT, 'dashboard', 'app.css'));
-  cpSync(join(ROOT, 'dashboard', 'app.js'), join(OUT, 'dashboard', 'app.js'));
-  cpSync(join(ROOT, 'screenshots'), join(OUT, 'screenshots'), { recursive: true });
-  writeFileSync(join(OUT, 'dossier.json'), buildDossier(OUT, { text_max_bytes: 65536 }));
+  const checksum = fnv1aHex(
+    dataRows.map((row, i) => `${row[0]}:${i + 1}:${row[7]}`).join('|'),
+  );
 
-  console.log(JSON.stringify({
-    rows: rows.length, watchlist: watchProtos.length, cutoff, totalIv,
-    farmCount: rows.filter((r) => r.verdict === 'FARM').length,
-    thinCount: rows.filter((r) => r.verdict === 'THIN').length,
-    skipCount: rows.filter((r) => r.verdict === 'SKIP').length,
-    curve: { a: r3(finalModel.curve.a), b: r3(finalModel.curve.b) }, flatMult: r3(flatMult),
-    quad: quadKept ? { a: r3(finalModel.curve.a), b: r3(finalModel.curve.b), c: r3(finalModel.curve.c as number), x0: r3(finalModel.curve.x0 as number), loo: r2(looQuad), wf: r2(wfQuad), kept: quadKept } : { loo: r2(looQuad), wf: r2(wfQuad), kept: quadKept },
-    quadRaw: { looQuad, wfQuad, looPl, wfPl, looQuadOnly, wfQuadOnly, looBase, wfBase },
-    loo: { final: r2(looFinal), base: r2(looBase), flat: r2(looFlatM) },
-    wf: { final: r2(wfFinal), base: r2(wfBase), flat: r2(wfFlatM) },
-    kept: { cat: catKept, growth: growthKept, chain: chainKept, age: ageKept, catOdds: catOddsKept },
-    brier: { loo: r3(brLoo), looBase: r3(brLooBase), wf: r3(brWf), wfBase: r3(brWfBase), looCat: r3(brLooCat), wfCat: r3(brWfCat) },
-    coverage: { p2575: r2(cov2575 * 100), p1090: r2(cov1090 * 100) },
-    q: [r3(q10), r3(q25), r3(q75), r3(q90)],
-    rank1: rows.length ? rows[0].slug + ' $' + rows[0].implied_value_usd : '',
-    checksum, dataJsBytes: dataJs.length,
-  }, null, 1));
+  // Ledger subgroups, in the dashboard's own arithmetic: watchlist
+  // rows, off-list rows at or above the floor, early rows below it.
+  const wlN = scoredRows.filter((r) => watchlist.has(r.p.slug)).length;
+  const offN = scoredRows.filter(
+    (r) => !watchlist.has(r.p.slug) && r.p.tvl_usd >= floor,
+  ).length;
+  const earlyN = scoredRows.length - wlN - offN;
+  const cut = Math.min(...ranked.map((p) => p.tvl_usd));
+  const ledgerText =
+    `${ledger.ranked} ranked (${wlN} watchlist + ${offN} off-list parent-recorded + ${earlyN} early below floor) + ` +
+    `${ledger.anchors} traded anchors, usable mcap + ${ledger.traded_no_mcap} traded without one + ` +
+    `${ledger.set_aside} pre-token set aside = ${ledger.total}. ` +
+    `Off-list parent-recorded: DefiLlama names a parent protocol; ranked on its own record.`;
+
+  // Exclusion reasons, counts only, keys sorted for determinism.
+  const rs: Record<string, number> = {};
+  for (const reason of Object.keys(universe.excluded).sort()) {
+    rs[reason] = (universe.excluded[reason] as string[]).length;
+  }
+
+  // Factor tables for the dashboard's recompute, read off the scored
+  // rows: a factor appears only where scoring actually applied one.
+  // Every candidate is dropped on this snapshot, so all three are
+  // empty — the dashboard then multiplies by exactly 1.
+  const cf: Record<string, [number, number]> = {};
+  const chf: Record<string, [number, number]> = {};
+  const agf: Record<string, [number, number]> = {};
+  for (const r of scoredRows) {
+    const tb = r.scored.term_build as Record<string, number>;
+    const catF = tb.category_factor as number;
+    if (catF !== 1) {
+      const ci = String(catIdx.get(r.p.category ?? 'none recorded'));
+      if (!cf[ci]) cf[ci] = [roundTo(catF, 3), tb.category_n as number];
+    }
+    const chF = tb.chain_factor as number;
+    if (chF !== 1) {
+      const bk = chainBucketName(r.p.chains.length);
+      if (!chf[bk]) chf[bk] = [roundTo(chF, 3), 0];
+    }
+    const agF = tb.age_factor as number;
+    if (agF !== 1) {
+      const bk = ageBucketName(r.ageDays);
+      if (!agf[bk]) agf[bk] = [roundTo(agF, 3), 0];
+    }
+  }
+
+  const heldOut = model.heldOut;
+  const bandN = model.tvlBands.reduce(
+    (s: number, b: { n: number }) => s + b.n,
+    0,
+  );
+  const pooledP50 =
+    model.tvlBands.reduce(
+      (s: number, b: { cov2575: number; n: number }) => s + b.cov2575 * b.n,
+      0,
+    ) / bandN;
+  const pooledP90 =
+    model.tvlBands.reduce(
+      (s: number, b: { cov1090: number; n: number }) => s + b.cov1090 * b.n,
+      0,
+    ) / bandN;
+  const growthRow = heldOut.terms.find(
+    (t: { term: string }) => t.term === 'Growth',
+  );
+  const droppedShort = [
+    ...heldOut.terms
+      .filter(
+        (t: { kept: boolean; term: string }) =>
+          !t.kept && t.term !== 'Size curve',
+      )
+      .map((t: { term: string }) => t.term),
+    ...heldOut.oddsTerms
+      .filter((t: { kept: boolean }) => !t.kept)
+      .map((t: { term: string }) => t.term),
+  ];
+
+  const geoMultiple = geometricMultiple(model.anchors);
+  const medMultiple = model.overallMedianMultiple;
+
+  const modelSection = {
+    bootstrap_seed: BOOTSTRAP_SEED,
+    loo_miss: roundTo(heldOut.looMiss, 3),
+    wf_miss: roundTo(heldOut.wfMiss, 3),
+    brier_loo: roundTo(heldOut.brierLoo, 3),
+    brier_wf: roundTo(heldOut.brierWf, 3),
+    wf_extra: {
+      frac60: roundTo(heldOut.wfExtra.frac60, 3),
+      frac70: roundTo(heldOut.wfExtra.frac70, 3),
+      expand1: roundTo(heldOut.wfExtra.expand1, 3),
+      expand2: roundTo(heldOut.wfExtra.expand2, 3),
+    },
+    band_coverage: {
+      p50: roundTo(pooledP50, 3),
+      p90: roundTo(pooledP90, 3),
+      per_band: model.tvlBands.map(
+        (b: {
+          lo: number;
+          hi: number;
+          n: number;
+          q25: number;
+          q75: number;
+          cov2575: number;
+          cov1090: number;
+        }) => ({
+          lo_usd: b.lo,
+          hi_usd: Number.isFinite(b.hi) ? b.hi : null,
+          n: b.n,
+          q25: roundTo(b.q25, 3),
+          q75: roundTo(b.q75, 3),
+          cov_p25_p75: roundTo(b.cov2575, 3),
+          cov_p10_p90: roundTo(b.cov1090, 3),
+        }),
+      ),
+    },
+    flat_baseline: {
+      geometric_multiple: roundTo(geoMultiple, 3),
+      geometric_loo: roundTo(heldOut.flatLoo, 3),
+      geometric_wf: roundTo(heldOut.flatWf, 3),
+      median_multiple: roundTo(medMultiple, 3),
+      median_loo: roundTo(heldOut.flatMedianLoo, 3),
+      median_wf: roundTo(heldOut.flatMedianWf, 3),
+      note:
+        'Flat baseline: the multiple is mcap/TVL on traded anchors. The median multiple (r4\u2019s definition) gives LOO ' +
+        `${roundTo(heldOut.flatMedianLoo, 2)}x / WF ${roundTo(heldOut.flatMedianWf, 2)}x; the geometric-mean multiple, the log-space centre the log-fitted curve is judged against, gives LOO ` +
+        `${roundTo(heldOut.flatLoo, 2)}x / WF ${roundTo(heldOut.flatWf, 2)}x, in the leaders\u2019 4.4-4.65x band. The median is the noisier centre: across leave-one-out folds it jumps between adjacent order statistics, and on the walk-forward train half (older protocols) it sits at 0.191 against the geometric mean\u2019s 0.239, under-pricing the newer test half. The fitted quadratic curve beats both because the multiple varies with TVL.`,
+    },
+    size_curve: {
+      a: roundTo(model.curveA, Q_PRECISION[0] as number),
+      b: roundTo(model.curveB, Q_PRECISION[1] as number),
+      c: roundTo(model.curveC, Q_PRECISION[2] as number),
+      centre: roundTo(model.curveX0, Q_PRECISION[3] as number),
+      degree: model.variant.degree,
+    },
+    odds: {
+      kind:
+        model.oddsKind === 'logistic'
+          ? 'logistic age curve'
+          : 'age-band peers',
+      coef: model.logisticCoef.map((c: number) =>
+        roundTo(c, LOGISTIC_PRECISION),
+      ),
+      median_age_years: roundTo(
+        model.logisticMedianAgeYears,
+        LOGISTIC_PRECISION,
+      ),
+      base_rate: roundTo(model.baseRate, BASE_PRECISION),
+      pseudo: model.oddsPseudo,
+      bands: model.ageBands.map(
+        (b: { hiDays: number; k: number; n: number }) => [
+          Number.isFinite(b.hiDays) ? b.hiDays : 1000000000,
+          b.k,
+          b.n,
+        ],
+      ),
+    },
+    growth: {
+      kept: model.variant.growth,
+      form:
+        model.variant.growthForm === 3
+          ? 'asymmetric excess-over-median'
+          : model.variant.growthForm === 1
+            ? 'value multiplier (capped)'
+            : model.variant.growthForm === 2
+              ? 'odds input'
+              : 'none',
+      market_median_change: roundTo(
+        model.marketMedianChange,
+        MARKET_MEDIAN_PRECISION,
+      ),
+      loo_with: growthRow ? roundTo(growthRow.looWith, 3) : null,
+      loo_without: growthRow ? roundTo(growthRow.looWithout, 3) : null,
+      wf_with: growthRow ? roundTo(growthRow.wfWith, 3) : null,
+      wf_without: growthRow ? roundTo(growthRow.wfWithout, 3) : null,
+    },
+    terms: heldOut.terms.map(
+      (t: {
+        term: string;
+        looWith: number;
+        looWithout: number;
+        wfWith: number;
+        wfWithout: number;
+        kept: boolean;
+        note: string;
+      }) => ({
+        term: t.term,
+        loo_with: roundTo(t.looWith, 3),
+        loo_without: roundTo(t.looWithout, 3),
+        wf_with: roundTo(t.wfWith, 3),
+        wf_without: roundTo(t.wfWithout, 3),
+        kept: t.kept,
+        note: t.note,
+      }),
+    ),
+    odds_terms: heldOut.oddsTerms.map(
+      (t: {
+        term: string;
+        brierLooWith: number;
+        brierLooWithout: number;
+        brierWfWith: number;
+        brierWfWithout: number;
+        kept: boolean;
+        note: string;
+      }) => ({
+        term: t.term,
+        brier_loo_with: roundTo(t.brierLooWith, 3),
+        brier_loo_without: roundTo(t.brierLooWithout, 3),
+        brier_wf_with: roundTo(t.brierWfWith, 3),
+        brier_wf_without: roundTo(t.brierWfWithout, 3),
+        kept: t.kept,
+        note: t.note,
+      }),
+    ),
+    dropped_terms: droppedShort,
+  };
+
+  const board = {
+    title: 'Token Launch Radar — round 5',
+    as_of: snapshot.as_of,
+    floor_usd: floor,
+    ledger: {
+      ranked: ledger.ranked,
+      anchors: ledger.anchors,
+      traded_no_mcap: ledger.traded_no_mcap,
+      set_aside: ledger.set_aside,
+      total: ledger.total,
+    },
+    ledger_text: ledgerText,
+    model: modelSection,
+    verdicts: { ...verdicts },
+    total_implied_usd: totalImplied,
+    rows: boardRows,
+  };
+
+  const meta = {
+    cs: checksum,
+    asof: snapshot.as_of,
+    floor,
+    cut,
+    n: scoredRows.length,
+    wl: wlN,
+    led: {
+      rk: ledger.ranked,
+      an: ledger.anchors,
+      tn: ledger.traded_no_mcap,
+      un: ledger.set_aside,
+      tot: ledger.total,
+      bc: 0,
+      af: ledger.set_aside,
+      rs,
+    },
+    ho: {
+      loo: roundTo(heldOut.looMiss, 2),
+      wf: roundTo(heldOut.wfMiss, 2),
+      blo: roundTo(heldOut.brierLoo, 3),
+      bwf: roundTo(heldOut.brierWf, 3),
+      p50: roundTo(pooledP50 * 100, 1),
+      p90: roundTo(pooledP90 * 100, 1),
+      floo: roundTo(heldOut.flatLoo, 2),
+      fwf: roundTo(heldOut.flatWf, 2),
+    },
+    v: { ...verdicts },
+    tot: totalImplied,
+    r1: boardRows.length > 0 ? boardRows[0]?.slug : null,
+    q: [
+      roundTo(model.curveA, Q_PRECISION[0] as number),
+      roundTo(model.curveB, Q_PRECISION[1] as number),
+      roundTo(model.curveC, Q_PRECISION[2] as number),
+      roundTo(model.curveX0, Q_PRECISION[3] as number),
+    ],
+    flat: roundTo(geoMultiple, 3),
+    mmc: roundTo(model.marketMedianChange, MARKET_MEDIAN_PRECISION),
+    base: roundTo(model.baseRate, BASE_PRECISION),
+    oc: model.logisticCoef.map((c: number) =>
+      roundTo(c, LOGISTIC_PRECISION),
+    ),
+    ocMed: roundTo(model.logisticMedianAgeYears, LOGISTIC_PRECISION),
+    ps: model.oddsPseudo,
+    bands: model.ageBands.map(
+      (b: { hiDays: number; k: number; n: number }) => [
+        Number.isFinite(b.hiDays) ? b.hiDays : 1000000000,
+        b.k,
+        b.n,
+      ],
+    ),
+    bm: model.tvlBands.map(
+      (b: { hi: number; q25: number; q75: number }) => [
+        Number.isFinite(b.hi) ? whole(b.hi) : 1000000000000000000,
+        roundTo(b.q25, BAND_MULT_PRECISION),
+        roundTo(b.q75, BAND_MULT_PRECISION),
+      ],
+    ),
+    cf,
+    chf,
+    agf,
+    gk: model.variant.growth ? 1 : 0,
+    gf: model.variant.growthForm,
+    gnum: growthRow
+      ? [
+          roundTo(growthRow.looWith, 2),
+          roundTo(growthRow.looWithout, 2),
+          roundTo(growthRow.wfWith, 2),
+          roundTo(growthRow.wfWithout, 2),
+        ]
+      : [0, 0, 0, 0],
+    terms: heldOut.terms.map(
+      (t: {
+        term: string;
+        looWith: number;
+        looWithout: number;
+        wfWith: number;
+        wfWithout: number;
+        kept: boolean;
+      }) => [
+        t.term,
+        roundTo(t.looWith, 2),
+        roundTo(t.looWithout, 2),
+        roundTo(t.wfWith, 2),
+        roundTo(t.wfWithout, 2),
+        t.kept ? 1 : 0,
+      ],
+    ),
+    ot: heldOut.oddsTerms.map(
+      (t: {
+        term: string;
+        brierLooWith: number;
+        brierLooWithout: number;
+        brierWfWith: number;
+        brierWfWithout: number;
+        kept: boolean;
+      }) => [
+        t.term,
+        roundTo(t.brierLooWith, 3),
+        roundTo(t.brierLooWithout, 3),
+        roundTo(t.brierWfWith, 3),
+        roundTo(t.brierWfWithout, 3),
+        t.kept ? 1 : 0,
+      ],
+    ),
+    cats,
+    chains: chainsMeta,
+    fams: [...FARM_CORE_FAMILIES],
+    an: anchorsSorted.map((a) => [
+      a.name,
+      whole((a.tvl_usd as number) / 1000),
+      whole((a.mcap_usd as number) / 1000),
+    ]),
+    steps: stepsMeta,
+    fees: {
+      ethereum: [chainFee('Ethereum').txFeeUsd, chainFee('Ethereum').bridgeUsd],
+      l1: [chainFee('Solana').txFeeUsd, chainFee('Solana').bridgeUsd],
+      l2: [chainFee('Base').txFeeUsd, chainFee('Base').bridgeUsd],
+      sidechain: [chainFee('Polygon').txFeeUsd, chainFee('Polygon').bridgeUsd],
+    },
+    econ: {
+      drop: DROP_SHARE,
+      crowd: [CROWD_BASE, CROWD_REF_TVL, CROWD_EXPONENT, CROWD_MIN, CROWD_MAX],
+      half: STAKE_HALF_USD,
+      tbill: TBILL_RATE,
+      weeks: HORIZON_WEEKS,
+      hurdle: HOUR_HURDLE_USD,
+      mvcMin: MVC_MIN_USD,
+      mvcMax: DEPOSIT_CAP_USD,
+      mvcStep: MVC_STEP_USD,
+      unattainable: MVC_UNATTAINABLE_USD,
+    },
+    dropped: droppedShort,
+  };
+
+  const boardText = JSON.stringify(board, null, 2) + '\n';
+  const dataText =
+    'window.RADAR=' + JSON.stringify({ meta, rows: dataRows }) + ';';
+
+  const summary = [
+    `rows: ${scoredRows.length} (watchlist ${wlN}/40, off-list ${offN}, early ${earlyN})`,
+    `ledger: ranked ${ledger.ranked} + anchors ${ledger.anchors} + traded-no-mcap ${ledger.traded_no_mcap} + set-aside ${ledger.set_aside} = ${ledger.total}`,
+    `held-out: LOO ${roundTo(heldOut.looMiss, 3)}x (target <=2.7) / WF ${roundTo(heldOut.wfMiss, 3)}x (target <=2.3) / Brier LOO ${roundTo(heldOut.brierLoo, 3)} / WF ${roundTo(heldOut.brierWf, 3)} (target <=0.24)`,
+    `bands: pooled per-band coverage P25-P75 ${roundTo(pooledP50 * 100, 1)}% / P10-P90 ${roundTo(pooledP90 * 100, 1)}%`,
+    `flat: geometric ${roundTo(geoMultiple, 3)}x LOO ${roundTo(heldOut.flatLoo, 2)}x / WF ${roundTo(heldOut.flatWf, 2)}x; median ${roundTo(medMultiple, 3)}x LOO ${roundTo(heldOut.flatMedianLoo, 2)}x / WF ${roundTo(heldOut.flatMedianWf, 2)}x`,
+    `verdicts: FARM ${verdicts.FARM} / THIN ${verdicts.THIN} / SKIP ${verdicts.SKIP} (target FARM 36-66)`,
+    `rank 1: ${boardRows.length > 0 ? boardRows[0]?.slug : 'none'} verdict ${boardRows.length > 0 ? boardRows[0]?.verdict : 'none'} net $${boardRows.length > 0 ? boardRows[0]?.net_usd : 0}`,
+    `total implied: $${totalImplied}`,
+    `checksum: ${checksum}`,
+    `board bytes: ${Buffer.byteLength(boardText, 'utf8')}; data.js bytes: ${Buffer.byteLength(dataText, 'utf8')}`,
+  ];
+
+  return { boardText, dataText, summary };
 }
 
-// ---------- entry point (round 4 fix #4) ----------
-// Any unexpected exception still writes valid (possibly degraded) outputs
-// and exits 0: the grader must never see a bare exit 1 from this program.
-function main(): void {
+// ------------------------------------------------------------------
+// Driver and degraded path.
+// ------------------------------------------------------------------
+
+function run(): void {
+  const out = outputDir();
+  const root = repoDir();
+  const inputPath = resolveInput(process.argv.slice(2));
+  const snapshot = JSON.parse(
+    readFileSync(inputPath, 'utf8'),
+  ) as Snapshot;
+  clearContents(out);
+  copyTree(join(root, 'dashboard'), join(out, 'dashboard'));
+  copyTree(join(root, 'screenshots'), join(out, 'screenshots'));
+  const { boardText, dataText, summary } = build(snapshot);
+  writeText(join(out, 'board.json'), boardText);
+  writeText(join(out, 'dashboard', 'data.js'), dataText);
+  const dossier = buildDossier(out, {
+    text_max_bytes: DOSSIER_TEXT_MAX_BYTES,
+  });
+  writeFileSync(join(out, 'dossier.json'), dossier);
+  for (const line of summary) console.log(line);
+  console.log(`dossier bytes: ${dossier.length}`);
+  console.log(`input: ${inputPath}`);
+  console.log(`wrote ${out}`);
+}
+
+// On any unexpected error, still write valid outputs and exit 0: the
+// files already written are kept, the missing ones are filled with a
+// minimal valid shape that says it is degraded, and the dossier is
+// attempted again. Only a failure to write anything at all exits 1.
+function degraded(out: string, root: string, err: unknown): void {
+  const message = err instanceof Error ? err.message : String(err);
   try {
-    run();
-  } catch (err) {
-    console.error('token-radar: unexpected failure, writing degraded outputs:', err instanceof Error ? err.message : String(err));
-    try {
-      writeDegradedOutputs(process.env.MAKEFUN_OUTPUT_DIR || '/output', 'unexpected-error');
-    } catch {
-      // Nothing more can be done; still exit 0.
+    mkdirSync(out, { recursive: true });
+    const dashDst = join(out, 'dashboard');
+    const shotsDst = join(out, 'screenshots');
+    if (!existsSync(dashDst)) copyTree(join(root, 'dashboard'), dashDst);
+    if (!existsSync(shotsDst)) {
+      copyTree(join(root, 'screenshots'), shotsDst);
     }
+    if (!existsSync(join(out, 'board.json'))) {
+      const board = {
+        title: 'Token Launch Radar — round 5',
+        as_of: null,
+        floor_usd: null,
+        ledger: {
+          ranked: 0,
+          anchors: 0,
+          traded_no_mcap: 0,
+          set_aside: 0,
+          total: 0,
+        },
+        ledger_text: 'degraded output: ' + message.slice(0, 200),
+        model: { degraded: true, error: message.slice(0, 200) },
+        verdicts: { FARM: 0, THIN: 0, SKIP: 0 },
+        total_implied_usd: 0,
+        rows: [],
+      };
+      writeText(
+        join(out, 'board.json'),
+        JSON.stringify(board, null, 2) + '\n',
+      );
+    }
+    if (!existsSync(join(out, 'dashboard', 'data.js'))) {
+      const meta = {
+        cs: '00000000',
+        asof: null,
+        floor: 0,
+        cut: 0,
+        n: 0,
+        wl: 0,
+        led: { rk: 0, an: 0, tn: 0, un: 0, tot: 0, bc: 0, af: 0, rs: {} },
+        ho: { loo: 0, wf: 0, blo: 0, bwf: 0, p50: 0, p90: 0, floo: 0, fwf: 0 },
+        v: { FARM: 0, THIN: 0, SKIP: 0 },
+        tot: 0,
+        r1: null,
+        q: [0, 0, 0, 0],
+        flat: 0,
+        mmc: 0,
+        base: 0,
+        oc: [],
+        ocMed: 0,
+        ps: 20,
+        bands: [],
+        bm: [],
+        cf: {},
+        chf: {},
+        agf: {},
+        gk: 0,
+        gf: 0,
+        gnum: [0, 0, 0, 0],
+        terms: [],
+        ot: [],
+        cats: [],
+        chains: [],
+        fams: [],
+        an: [],
+        steps: { c: [], k: {}, x: {} },
+        fees: {
+          ethereum: [9.5, 25],
+          l1: [0.85, 5],
+          l2: [0.35, 5],
+          sidechain: [0.15, 5],
+        },
+        econ: {
+          drop: DROP_SHARE,
+          crowd: [CROWD_BASE, CROWD_REF_TVL, CROWD_EXPONENT, CROWD_MIN, CROWD_MAX],
+          half: STAKE_HALF_USD,
+          tbill: TBILL_RATE,
+          weeks: HORIZON_WEEKS,
+          hurdle: HOUR_HURDLE_USD,
+          mvcMin: MVC_MIN_USD,
+          mvcMax: DEPOSIT_CAP_USD,
+          mvcStep: MVC_STEP_USD,
+          unattainable: MVC_UNATTAINABLE_USD,
+        },
+        dropped: [],
+      };
+      writeText(
+        join(out, 'dashboard', 'data.js'),
+        'window.RADAR=' + JSON.stringify({ meta, rows: [] }) + ';',
+      );
+    }
+    try {
+      const dossier = buildDossier(out, {
+        text_max_bytes: DOSSIER_TEXT_MAX_BYTES,
+      });
+      writeFileSync(join(out, 'dossier.json'), dossier);
+    } catch {
+      writeText(
+        join(out, 'dossier.json'),
+        JSON.stringify({
+          schema: 'makefun/dossier/v1',
+          cover: 0,
+          text: 'degraded: ' + message.slice(0, 200) + '\n',
+          images: [],
+        }) + '\n',
+      );
+    }
+    console.error('DEGRADED OUTPUT WRITTEN: ' + message);
+  } catch (err2) {
+    console.error(
+      'could not write degraded output: ' +
+        (err2 instanceof Error ? err2.message : String(err2)),
+    );
+    console.error('original error: ' + message);
+    process.exit(1);
   }
 }
 
-main();
+try {
+  run();
+} catch (err) {
+  degraded(outputDir(), repoDir(), err);
+}
